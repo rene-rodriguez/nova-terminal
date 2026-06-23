@@ -73,7 +73,8 @@ jobs:
       matrix:
         include:
           - runner: macos-14   # Apple Silicon (arm64)
-          - runner: macos-13   # Intel (x86_64)
+          # macOS Intel (x86_64) dropped: GitHub is deprecating the macos-13
+          # runner and the Intel-Mac audience is shrinking. Intel = build from source.
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4

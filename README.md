@@ -74,9 +74,9 @@ RPATH). Make sure `~/.local/bin` is on your `PATH`, then run `nova-terminal`.
 | Pin a specific version | `curl … \| NOVA_VERSION=v0.1.1 sh` |
 | Authenticate a private mirror | `curl … \| NOVA_GITHUB_TOKEN=… sh` (also reads `GH_TOKEN` / `GITHUB_TOKEN`) |
 
-Prebuilt targets: **Linux x86_64**, **macOS arm64**, **macOS x86_64**. Anything else falls back to
-[building from source](#build-from-source). Releases are built and signed by CI
-(`.github/workflows/release.yml`) on every `v*` tag.
+Prebuilt targets: **Linux x86_64** and **macOS arm64** (Apple Silicon). **Intel Macs** and any other
+target build from [source](#build-from-source) — the installer prints exactly how if no prebuilt
+binary matches. Releases are built by CI (`.github/workflows/release.yml`) on every `v*` tag.
 
 ### Build from source
 
