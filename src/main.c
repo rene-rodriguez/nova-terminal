@@ -1798,13 +1798,13 @@ int main(void)
     // Small padding from window edges, in pixels.  Passed to render_terminal()
     // and handle_mouse() so all layout uses a single value.
     const int pad = 4;
-    const int sidebar_width = 380;   // logical; scaled by content scale below
-    const int min_terminal_w = 320;
+    const int sidebar_width = 380;   // logical px; the UI renders in logical space
+    const int min_terminal_w = 320;  // (crispness comes from the 2x font texture)
 
     Layout lo = layout_compute(GetScreenWidth(), GetScreenHeight(),
                                ui_sidebar_visible(),
-                               (int)(sidebar_width * applied_scale), pad,
-                               (int)(min_terminal_w * applied_scale));
+                               sidebar_width, pad,
+                               min_terminal_w);
     int term_area_w = lo.terminal.w;
 
     uint16_t term_cols = 0;
@@ -2052,7 +2052,8 @@ int main(void)
 
         // Re-detect content scale: if the window moved to a monitor with a
         // different scale, rebuild the font (and reflow) so font_size stays a
-        // consistent on-screen size. ui_scale also drives the UI widget sizes.
+        // consistent on-screen size. Scale only drives font-texture resolution;
+        // the UI and layout are sized in logical px (see the 1.0f passed below).
         float ui_scale = nova_content_scale().y;
         if (ui_scale != applied_scale) {
             if (rebuild_terminal_font(&mono_font, font_size, &cell_width, &cell_height,
@@ -2065,8 +2066,8 @@ int main(void)
         }
 
         lo = layout_compute(w, h, ui_sidebar_visible(),
-                            (int)(sidebar_width * ui_scale), pad,
-                            (int)(min_terminal_w * ui_scale));
+                            sidebar_width, pad,
+                            min_terminal_w);
         term_area_w = lo.terminal.w;
         if (w != prev_width || h != prev_height || term_area_w != prev_term_area_w) {
             compute_terminal_grid(term_area_w, pad, cell_width, cell_height,
@@ -2303,8 +2304,10 @@ int main(void)
                      (Color){60, 60, 60, 255});
             char submitted[1024] = "";
             char run_cmd[1024] = "";
+            // The UI renders in logical space (crispness from the 2x font
+            // texture), so widgets size at scale 1.0 to match the terminal.
             if (ui_sidebar_draw(mono_font, lo.sidebar, submitted, (int)sizeof(submitted),
-                                run_cmd, (int)sizeof(run_cmd), ui_scale)) {
+                                run_cmd, (int)sizeof(run_cmd), 1.0f)) {
                 // A new question interrupts any in-flight stream.
                 if (active_stream) {
                     ai_stream_cancel(active_stream);
@@ -2332,7 +2335,7 @@ int main(void)
         }
 
         // Inline AI prompt: floating over the terminal, below the settings modal.
-        ui_inline_draw(mono_font, ui_scale);
+        ui_inline_draw(mono_font, 1.0f);
         const char *inline_prompt = ui_inline_take_prompt();
         if (inline_prompt) {
             const char *ikey = resolve_api_key(&cfg);
@@ -2372,7 +2375,7 @@ int main(void)
 
         if (ui_settings_open()) {
             bool saved = false;
-            ui_settings_draw(&cfg, &saved, ui_scale);
+            ui_settings_draw(&cfg, &saved, 1.0f);
             if (saved) {
                 if (!config_save(&cfg, config_path)) {
                     fprintf(stderr, "warning: failed to save config at %s\n", config_path);
