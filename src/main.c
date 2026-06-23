@@ -1712,8 +1712,8 @@ static void apply_gui_style(const Theme *t)
     Color accent = (Color){t->ansi[4].r, t->ansi[4].g, t->ansi[4].b, 255};  // blue
     Color border = color_mix(bg, fg, 0.30f);
     Color base   = color_mix(bg, fg, 0.08f);
-    Color base_f = color_mix(bg, accent, 0.22f);
-    Color base_p = color_mix(bg, accent, 0.38f);
+    Color base_f = color_mix(bg, accent, 0.14f);   // hover: faint tint
+    Color base_p = color_mix(bg, accent, 0.18f);   // focused/editing: mostly dark — focus is shown by the accent border, not a heavy fill
     Color dim    = color_mix(bg, fg, 0.45f);
 
     GuiSetStyle(DEFAULT, BACKGROUND_COLOR, ColorToInt(bg));
@@ -1729,7 +1729,7 @@ static void apply_gui_style(const Theme *t)
 
     GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, ColorToInt(accent));
     GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED,   ColorToInt(base_p));
-    GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED,   ColorToInt(accent));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED,   ColorToInt(fg));   // readable while typing (was accent-on-accent)
 
     GuiSetStyle(DEFAULT, BORDER_COLOR_DISABLED, ColorToInt(border));
     GuiSetStyle(DEFAULT, BASE_COLOR_DISABLED,   ColorToInt(base));
