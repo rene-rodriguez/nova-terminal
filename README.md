@@ -1,6 +1,8 @@
 <div align="center">
 
-# Nova Terminal
+<img src="assets/nova-terminal-logo.png" alt="Nova Terminal — AI-powered local terminal" width="480">
+
+<br>
 
 **A native, GPU-accelerated terminal with the AI you actually want — and none of the lock-in.**
 
