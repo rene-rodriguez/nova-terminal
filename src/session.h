@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/types.h>   // pid_t
 
 typedef struct Session Session;
 
@@ -28,7 +29,9 @@ void session_resize(Session *s, uint16_t cols, uint16_t rows,
 
 // Accessors.
 int         session_pty_fd(const Session *s);
+pid_t       session_child_pid(const Session *s);    // child PID for signal/cleanup
 void       *session_engine(Session *s);             // returns TermEngine* (opaque here)
+void       *session_cmdblocks(Session *s);          // returns CmdBlocks* (opaque here)
 bool        session_child_alive(const Session *s);
 const char *session_cwd(const Session *s);          // last OSC-7 cwd, or $HOME
 
@@ -36,5 +39,10 @@ const char *session_cwd(const Session *s);          // last OSC-7 cwd, or $HOME
 // Returns true on success.
 bool session_reap(Session *s);
 bool session_respawn(Session *s, const char *cwd);
+int  session_exit_status(const Session *s);        // -1 if alive / unknown
+
+// Opaque userdata slot for the host (main.c stores EffectsContext here).
+void  session_set_userdata(Session *s, void *userdata);
+void *session_userdata(const Session *s);
 
 #endif // FANGS_SESSION_H

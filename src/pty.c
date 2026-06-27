@@ -22,7 +22,7 @@ extern int forkpty(int *__amaster, char *__name,
 #endif
 
 int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
-              int cell_width, int cell_height)
+              int cell_width, int cell_height, const char *cwd)
 {
     int pty_fd;
     struct winsize ws = {
@@ -59,6 +59,11 @@ int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
         // other profile-added entries would be missing.
         char login_argv0[256];
         snprintf(login_argv0, sizeof(login_argv0), "-%s", shell_name);
+
+        // Open in the requested directory (a new tab/pane inherits the focused
+        // pane's cwd). Ignore failure — fall back to the inherited cwd.
+        if (cwd && cwd[0])
+            (void)(chdir(cwd) == 0);
 
         setenv("TERM", "xterm-256color", 1);
         execl(shell, login_argv0, (char *)NULL);

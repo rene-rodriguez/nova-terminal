@@ -46,9 +46,23 @@ bool ui_sidebar_draw(Font font, Rect bounds, char *out_prompt, int out_prompt_si
 // Prefill the input box with `text` (e.g. the default question for a block).
 void ui_sidebar_prefill(const char *text);
 
-// Set a oneshot context string that will be prepended to the next user message
-// as a system-like preamble. The context is cleared after a single use.
+// Open the sidebar focused for editing, and suppress the next frame's
+// mouse-driven focus recompute — so the same click that triggered this (e.g. an
+// in-terminal "Ask AI" button) doesn't immediately unfocus the input again.
+void ui_sidebar_open_focused(void);
+
+// Set a oneshot context string for the next AI send (e.g. a §15 command block).
 // Takes ownership of a malloc'd string (caller must not free after passing).
 void ui_sidebar_set_oneshot_context(char *context);
+
+// Take ownership of the pending oneshot context (or NULL), clearing it. The
+// host calls this right after a submit and passes it to the request builder, so
+// the context reaches the model without being shown in the chat bubble. The
+// caller must free() the returned string.
+char *ui_sidebar_take_oneshot_context(void);
+
+// E5 (§18): Tell the sidebar whether an API key is available, so it can render
+// a first-run setup card instead of a dead input box.
+void ui_sidebar_set_has_key(bool has_key);
 
 #endif // FANGS_UI_SIDEBAR_H

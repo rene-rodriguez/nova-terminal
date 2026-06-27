@@ -1,5 +1,6 @@
 // ai_block unit tests: context format, byte-budget trim, question-by-exit-code.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "ai_block.h"
 
@@ -88,6 +89,28 @@ static void test_context_trim(void)
     CHECK(x_count > 0, "some output survived trimming");
 }
 
+static void test_large_output_not_capped(void)
+{
+    // Output larger than the old fixed 4096-byte trim buffer, with a cap big
+    // enough to hold well over 4096 bytes of it. The trim path must size to the
+    // cap, not a fixed 4096 — regression test for the removed stack-buffer cap.
+    char *big = (char *)malloc(20000);
+    memset(big, 'x', 19999);
+    big[19999] = '\0';
+
+    char buf[10000];
+    int n = ai_block_build_context("cmd", big, 0, buf, (int)sizeof(buf));
+    CHECK(n > 0, "large output: build succeeds");
+    CHECK(n < (int)sizeof(buf), "large output: fits in cap");
+
+    int x_count = 0;
+    for (int i = 0; buf[i]; i++)
+        if (buf[i] == 'x') x_count++;
+    CHECK(x_count > 5000, "large output: carries >5000 bytes (not capped at 4096)");
+
+    free(big);
+}
+
 static void test_cap_too_small(void)
 {
     char tiny[16];
@@ -103,6 +126,7 @@ int main(void)
     test_output_null();
     test_command_null();
     test_context_trim();
+    test_large_output_not_capped();
     test_cap_too_small();
 
     fprintf(stderr, "\n%d / %d passed, %d failed\n",

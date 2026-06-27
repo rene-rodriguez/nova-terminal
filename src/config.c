@@ -85,6 +85,14 @@ static void apply_key_value(AppConfig *c, const char *section,
             int parsed = 0;
             if (parse_int_value(value, &parsed) && parsed > 0)
                 c->scrollback = parsed;
+        } else if (strcmp(key, "cursor_style") == 0) {
+            int parsed = 0;
+            if (parse_int_value(value, &parsed) && parsed >= 0 && parsed <= 2)
+                c->cursor_style = parsed;
+        } else if (strcmp(key, "cursor_blink") == 0) {
+            bool parsed = false;
+            if (parse_bool_value(value, &parsed))
+                c->cursor_blink = parsed;
         }
     } else if (strcmp(section, "ai") == 0) {
         if (strcmp(key, "provider") == 0) {
@@ -129,6 +137,9 @@ void config_defaults(AppConfig *c)
     copy_string(c->api_key, sizeof(c->api_key), "");
     c->stream = true;
     c->max_tokens = 1024;
+
+    c->cursor_style = 0;    // block
+    c->cursor_blink  = true;
 }
 
 const char *config_default_path(void)
@@ -216,6 +227,8 @@ bool config_save(const AppConfig *c, const char *path)
         "font_size = %d\n"
         "theme = %s\n"
         "scrollback = %d\n"
+        "cursor_style = %d\n"
+        "cursor_blink = %s\n"
         "\n"
         "[ai]\n"
         "provider = %s\n"
@@ -228,6 +241,8 @@ bool config_save(const AppConfig *c, const char *path)
         c->font_size,
         c->theme,
         c->scrollback,
+        c->cursor_style,
+        c->cursor_blink ? "true" : "false",
         c->provider,
         c->endpoint,
         c->model,

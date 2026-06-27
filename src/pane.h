@@ -63,4 +63,8 @@ PaneNode *pane_first_leaf(PaneNode *root);
 // Find the next/prev leaf in a flat traversal.
 PaneNode *pane_next_leaf(PaneNode *root, PaneNode *cur);
 
+// Collect all leaf nodes into a flat array. `max` is the array capacity;
+// `*n` is set to the number collected (capped at max).
+void pane_collect_leaves(PaneNode *root, PaneNode **out, int max, int *n);
+
 #endif // FANGS_PANE_H

@@ -352,11 +352,11 @@ export FANGS_API_KEY=sk-...      # preferred over putting the key in the file
 
 # Post-v1 Enhancements
 
-> The sections below (§15–§16) specify enhancements designed **after** the v1 feature set shipped.
-> They are additive: both preserve every non-negotiable invariant in §1 (PTY byte stream never
-> altered, no command auto-executed, secrets only to the configured endpoint) and leave the
-> `term_engine` / `ai_provider` seams unchanged. Implementation sequencing and steps live in
-> `plan.md` §7 → *Post-v1 Enhancements*.
+> The sections below (§15–§21) specify enhancements designed **after** the v1 feature set shipped:
+> the feature enhancements §15–§16 (E1–E2) and the polish round §17–§21 (E3–E7). They are additive:
+> all preserve every non-negotiable invariant in §1 (PTY byte stream never altered, no command
+> auto-executed, secrets only to the configured endpoint) and leave the `term_engine` / `ai_provider`
+> seams unchanged. Implementation sequencing and steps live in `plan.md` §7 → *Post-v1 Enhancements*.
 
 ## 15. Command Blocks → AI Context (`cmdblocks` × `ui_sidebar`)
 
@@ -567,3 +567,182 @@ confirm dialog in v1 of this feature.
 - New tabs/panes inherit the focused pane's cwd when available.
 - `pane_tests` + `session_tests` + extended `layout_tests` green; build warning-clean; every §1
   invariant intact (byte stream untouched, no auto-exec, seams unchanged).
+
+# Polish Round (E3–E7)
+
+> The sections below (§17–§21) specify a **polish round**: refinement of the shipped feature set, not
+> new surfaces (tabs/splits §16 are explicitly *not* part of this round). They share one thesis — the
+> terminal engine is themed but the app around it is not, text styling is faked while the engine already
+> hands us the real data, and failures only reach stderr. §17 (UI theming) is the keystone the others
+> draw their colors from; do it first. All preserve every §1 invariant.
+
+## 17. UI Theming (`ui_theme.{c,h}` — new, pure, testable)
+
+### 17.1 Goal
+Make every pixel of app chrome derive from the active terminal `Theme` instead of hardcoded dark RGB.
+Today `Theme` (`theme.h`: `bg`, `fg`, `cursor`, `ansi[16]`, `is_light`) only colors terminal output;
+the sidebar, search bar, selection, scrollbar, and cursor alpha are hardcoded dark literals scattered
+across `main.c` and `ui_sidebar.c`, so **every light theme is unreadable** and the app reads as two
+unrelated layers. We derive chrome from the theme rather than adding ~20 color knobs to config.
+
+### 17.2 The module
+A pure function, no raylib/ghostty types in the header (mirrors `theme.h`), returning a small struct of
+chrome colors derived by blending toward `fg` over `bg` and flipping contrast on `is_light`:
+
+```c
+// ui_theme.h — pure; no window/engine dependency, so it unit-tests without a context.
+typedef struct { unsigned char r, g, b, a; } UiColor;
+
+typedef struct {
+    UiColor panel_bg, panel_border;   // sidebar / settings / inline overlay
+    UiColor selection;                // terminal text selection wash
+    UiColor search_bg, search_border, search_hit;
+    UiColor scrollbar;                // thumb
+    unsigned char cursor_alpha;       // block-cursor fill alpha
+    UiColor msg_user, msg_assistant, msg_system;   // sidebar role tints
+    UiColor accent;                   // buttons, focus, ⚡ Explain error
+} UiTheme;
+
+UiTheme ui_theme_derive(const Theme *t);   // pure
+```
+
+The `main.c`/`ui_sidebar.c`/etc. layer converts `UiColor` → raylib `Color` at the draw site (the seam
+stays raylib-free). Recompute the `UiTheme` whenever the theme changes, on the same path that already
+calls `term_engine_apply_theme` (initial load + `Ctrl+,` hot-reload).
+
+### 17.3 Replacement sites (all current hardcoded literals → `UiTheme`)
+`main.c`: selection `(120,145,205,90)`; search hit `(235,200,90,120)`; search box bg/border; scrollbar
+`(200,200,200,128)`; cursor fill alpha `128`. `ui_sidebar.c`: panel bg `(28,30,34,255)`; role tints.
+`ui_settings.c`: modal bg. `ui_inline.c`: overlay bg + waiting/error text. `cmdblocks.c`: gutter / badge
+/ button colors and the `⚡ Explain error` accent.
+
+### 17.4 Acceptance
+- `tests/ui_theme_tests.c` (new, in `ctest`): for both a known light and dark theme, every derived
+  color is legible (minimum contrast vs `bg`), `selection` differs visibly from `bg`, and `is_light`
+  flips the chrome polarity. Pure, no window.
+- Switching to a light theme via `Ctrl+,` leaves the sidebar, search bar, selection, scrollbar, and
+  cursor all readable; dark themes are unchanged from today. Build warning-clean.
+
+## 18. Crisp Text & Cursor Rendering (`main.c` render path)
+
+### 18.1 Goal
+The cell renderer (`main.c` ~1250–1263) reads only `bold/italic/inverse` and **fakes** them (bold =
+draw-twice-1px; italic = 1/6 shear; no underline at all). The engine actually exposes the full
+`GhosttyStyle` (`bold, italic, faint, blink, inverse, invisible, strikethrough, overline, underline`
+[+ `underline_color`]) and full cursor state on the render state — we discard it. Render it properly.
+
+### 18.2 Real bold via a bold font face
+Add `assets/JetBrainsMono-Bold.ttf`; generalize the single-font `bin2header` block in `CMakeLists.txt`
+(~46–57) to also emit `font_jetbrains_mono_bold.h`. Load a second `Font bold_font` beside the regular
+one (`main.c` ~109) and use it when `style.bold`, dropping the draw-twice hack. JBM Bold shares the
+regular advance width, so the cell grid is unaffected. (`UnloadFont` it in cleanup beside `mono_font`.)
+
+### 18.3 Decorations
+In the cell loop, all theme-`fg` colored (or `underline_color` when set):
+- `underline` → bottom line; honor `GHOSTTY_SGR_UNDERLINE_*` (single / double / curly at minimum).
+- `strikethrough` → mid line; `overline` → top line.
+- `faint` → blend `fg` ~50% toward `bg`; `invisible` → skip the glyph draw entirely.
+
+### 18.4 Cursor with state
+Replace the flat filled block (`main.c` ~1293–1308):
+- Read `GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE` → render `BAR` / `BLOCK` / `UNDERLINE` / hollow.
+- Read `GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING`; drive a blink phase off a frame timer (skip-draw on
+  the off phase). Block cursor uses `UiTheme.cursor_alpha`.
+- Render `BLOCK_HOLLOW` whenever `!IsWindowFocused()` (raylib) — the strongest "real terminal" tell.
+- Optional: distinct treatment when `CURSOR_PASSWORD_INPUT`.
+
+Add opt-in `AppConfig` fields only where the engine can't decide: `cursor_style_default`,
+`cursor_blink` (defaults preserve today's behavior). No new test module required; verification is visual.
+
+### 18.5 Acceptance
+- `printf` SGR samples (bold / italic / single+double+curly underline / strikethrough / overline /
+  faint / inverse / invisible) and a `vim` buffer render each decoration; bold uses real bold glyphs.
+- Cursor switches block↔bar↔underline per app, blinks when the app asks, and goes hollow on focus loss.
+- Build warning-clean; existing suites green.
+
+## 19. Error Surfacing & First-Run (`toast.{c,h}` — new + `ui_sidebar` card)
+
+### 19.1 Goal
+Config-load, font-load, engine-create, config-save, config-apply (`main.c` ~1748/1815/1826/2049/2481)
+and AI HTTP errors currently reach **stderr only** — invisible inside `Fangs.app`. Surface them in-window,
+and turn the worst silent failure (no API key) into a first-run onboarding moment.
+
+### 19.2 The toast queue
+```c
+// toast.h — enqueue/expire/cap logic is pure & testable; drawing lives in main.c.
+typedef enum { TOAST_INFO, TOAST_WARN, TOAST_ERROR } ToastLevel;
+
+void  toast_push(ToastLevel level, const char *msg);     // copies msg; bounded ring (drops oldest)
+void  toast_tick(double dt);                              // advance TTL / fade
+int   toast_count(void);                                  // active toasts, newest first
+bool  toast_get(int i, ToastLevel *level, const char **msg, float *alpha);  // for the draw loop
+```
+Draw a stack of fading pills bottom-right each frame, colored from `UiTheme` (§17). Route the existing
+stderr failures through `toast_push` **in addition to** stderr. AI errors (`ai_http.c` /
+`ui_sidebar.c`) surface as an `ERROR` toast.
+
+### 19.3 First-run "connect your key" card
+When no API key resolves (env `FANGS_API_KEY` or `[ai] api_key` — reuse the existing `resolve_api_key`
+check) and the sidebar is opened, `ui_sidebar.c` renders a card instead of a dead input: one line on
+`FANGS_API_KEY`, and a button that opens the settings modal (`Ctrl+,`). No key is ever written by this.
+
+### 19.4 Discoverability
+Ship a commented `docs/config.example` — every `AppConfig` field with its default and a one-line note —
+and reference it from `README.md`.
+
+### 19.5 Acceptance
+- `tests/toast_tests.c` (new, in `ctest`): push beyond capacity drops oldest; TTL expiry removes a
+  toast; `toast_get` reports newest-first with a decreasing alpha. Pure, no window.
+- A bad AI endpoint shows an error toast (not silence); a corrupt config shows a load toast and applies
+  defaults; with no key, opening the sidebar shows the connect-key card. Build warning-clean.
+
+## 20. AI Sidebar Polish (`ui_sidebar.{c,h}`)
+
+### 20.1 Goal
+Make the differentiator feel finished: readable code in replies, calm streaming, and a discoverable,
+keyboard-driven path into the §15 "Ask AI" affordance.
+
+### 20.2 Scope
+- **Syntax-highlighted fenced code.** During the existing word-wrap pass, detect ```lang fences and
+  render the fenced span in a mono box with a lightweight heuristic token tint (keywords / strings /
+  comments / numbers), colored from `UiTheme`. Heuristic only — no real parser.
+- **Smooth streaming auto-scroll.** While tokens arrive, lerp the scroll offset toward the bottom each
+  frame (stop if the user scrolls up), replacing any hard snap.
+- **Copy-whole-reply** button per assistant message, beside the existing per-fence Run/Copy.
+- **"Ask AI about the last command"** keybinding (e.g. `Cmd+Shift+/`), routed in `main.c` input
+  handling: find the most recent OSC-133 block via `cmdblocks`, build context with the existing
+  `ai_block_build_context()` (§15.3), and open the sidebar prefilled via the existing
+  `ui_sidebar_set_oneshot_context()` + `ui_sidebar_prefill()` (§15.4) — the same path the hover
+  button uses, just keyboard-driven and discoverable. Redaction (§7.3) still applies. No auto-send.
+
+### 20.3 Acceptance
+- A reply containing a fenced block renders highlighted; streaming auto-scrolls smoothly and yields to
+  manual scroll-up; copy-reply copies the full message.
+- With OSC-133 active, the shortcut opens the sidebar prefilled with the last block's context; with no
+  blocks, it is a no-op (or a toast). Build warning-clean; byte stream + invariants untouched.
+
+## 21. macOS Distribution & Window Polish (`scripts/` · `packaging/` · `main.c`)
+
+### 21.1 Goal
+Drop the first-launch Gatekeeper friction and make the window behave like a native app.
+
+### 21.2 Notarization (gated on an Apple Developer ID)
+Today `packaging/macos/fangs.rb` ships an **ad-hoc-signed** zip whose caveat tells users to
+`xattr -dr com.apple.quarantine` or right-click→Open; `scripts/macos-bundle.sh` and
+`.github/workflows/release.yml` do no real signing. Add Developer ID signing + a hardened-runtime
+entitlements plist + `notarytool submit --wait` + `stapler staple` to the bundle/release flow, then drop
+the `xattr` caveat from the cask.
+**Prerequisite:** a paid Apple Developer ID, an app-specific password / App Store Connect API key, and
+the entitlements plist, stored as CI secrets. If unavailable, ship §21.3 and leave a documented stub.
+
+### 21.3 Window polish (no account required)
+- **Remember window size & position** across launches: persist on resize/move and restore on startup
+  instead of the hardcoded `800×600` (`main.c` ~1757). Store in a small state file (or new `AppConfig`
+  fields).
+- **Mouse-cursor affordances:** `SetMouseCursor` to I-beam over terminal text, pointer over
+  buttons/links, default elsewhere — keyed off the hover regions already computed each frame.
+
+### 21.4 Acceptance
+- Relaunch restores the prior window size/position; hovering text vs buttons changes the cursor.
+- If notarization lands: `spctl -a -vvv build/Fangs.app` reports *accepted*, and a freshly downloaded
+  release opens without the right-click dance; the cask caveat no longer mentions `xattr`.

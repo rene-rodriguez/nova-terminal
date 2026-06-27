@@ -19,9 +19,11 @@ typedef void (*PtySink)(void *userdata, const uint8_t *data, size_t len);
 
 // Spawn the user's shell ($SHELL → passwd → /bin/sh) in a new pty.
 // Returns the non-blocking master fd (>= 0) and stores the child pid in
-// *child_out, or -1 on failure.
+// *child_out, or -1 on failure. If `cwd` is non-NULL and non-empty, the child
+// chdir()s there before exec (used so a new tab/pane opens in the focused
+// pane's directory); NULL inherits the parent's working directory.
 int  pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
-               int cell_width, int cell_height);
+               int cell_width, int cell_height, const char *cwd);
 
 // Best-effort write to the pty master fd (handles EINTR/partial/EAGAIN).
 void pty_write(int pty_fd, const char *buf, size_t len);

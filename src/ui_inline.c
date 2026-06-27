@@ -5,6 +5,7 @@
 
 #include "raylib.h"
 #include "raygui.h"
+#include "ui_theme.h"
 
 #define INLINE_INPUT_SIZE 512
 #define INLINE_STATUS_SIZE 160
@@ -86,12 +87,12 @@ void ui_inline_draw(Font font, float scale)
     if (y < 8) y = 8;
 
     Rectangle panel = {(float)x, (float)y, (float)w, (float)h};
-    DrawRectangleRec(panel, (Color){32, 34, 40, 245});
-    DrawRectangleLinesEx(panel, 1.0f, (Color){90, 95, 105, 255});
+    DrawRectangleRec(panel, UI2RAY(g_ui_theme.inline_bg));
+    DrawRectangleLinesEx(panel, 1.0f, UI2RAY(g_ui_theme.inline_border));
 
     DrawTextEx(font, "Ctrl+Space — ask for a command",
                (Vector2){panel.x + 12*s, panel.y + 8*s}, 14.0f*s, 0,
-               (Color){150, 160, 175, 255});
+               UI2RAY(g_ui_theme.subtitle));
 
     Rectangle row = {panel.x + 12*s, panel.y + 32*s, panel.width - 24*s, 28*s};
 
@@ -103,7 +104,7 @@ void ui_inline_draw(Font font, float scale)
         GuiSetStyle(DEFAULT, TEXT_SIZE, prev_ts);
         DrawTextEx(font, "Enter to stage · Esc to cancel",
                    (Vector2){panel.x + 12*s, panel.y + h - 16*s}, 11.0f*s, 0,
-                   (Color){110, 115, 125, 255});
+                   UI2RAY(g_ui_theme.subtitle));
         if (enter && input_text[0] != '\0') {
             snprintf(pending_prompt, sizeof(pending_prompt), "%s", input_text);
             prompt_ready = true;
@@ -111,12 +112,12 @@ void ui_inline_draw(Font font, float scale)
             snprintf(status_text, sizeof(status_text), "thinking…");
         }
     } else {  // INLINE_WAITING (possibly showing an error)
-        Color c = is_error ? (Color){235, 150, 150, 255}
-                           : (Color){200, 205, 215, 255};
+        Color c = is_error ? UI2RAY(g_ui_theme.inline_error)
+                           : UI2RAY(g_ui_theme.text);
         DrawTextEx(font, status_text[0] ? status_text : "thinking…",
                    (Vector2){row.x, row.y + 4*s}, 16.0f*s, 0, c);
         DrawTextEx(font, "Esc to dismiss",
                    (Vector2){panel.x + 12*s, panel.y + h - 16*s}, 11.0f*s, 0,
-                   (Color){110, 115, 125, 255});
+                   UI2RAY(g_ui_theme.subtitle));
     }
 }

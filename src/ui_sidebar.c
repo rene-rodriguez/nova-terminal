@@ -3,10 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "raylib.h"
 #include "raygui.h"
 #include "ui_sidebar_model.h"
+#include "ui_theme.h"
+#include "ui_settings.h"
 #include "cmdextract.h"
 
 #define MAX_MESSAGES 256
@@ -35,9 +38,13 @@ static float scroll_offset = 0.0f;
 // E1 (§15): oneshot context + prefill
 static char *oneshot_context = NULL;   // malloc'd, takes ownership
 
-// Track whether submit just happened so we can clear the oneshot context before
-// the next frame's draw (the context is consumed when the user sends).
-static bool consumed_oneshot = false;
+// One-shot latch: skip the next draw's mouse-driven focus recompute so the
+// click that opened the sidebar (an in-terminal "Ask AI" button) doesn't
+// immediately unfocus the input on the same frame.
+static bool focus_lock_once = false;
+
+// E5 (§18): first-run card — set by host via ui_sidebar_set_has_key()
+static bool has_key = true;
 
 static bool point_in_rect(Vector2 p, Rect r)
 {
@@ -58,10 +65,10 @@ static const char *role_label(MsgRole role)
 static Color role_color(MsgRole role)
 {
     switch (role) {
-    case MSG_USER: return (Color){225, 235, 255, 255};
-    case MSG_ASSISTANT: return (Color){230, 255, 235, 255};
-    case MSG_SYSTEM: return (Color){210, 210, 210, 255};
-    default: return RAYWHITE;
+    case MSG_USER: return UI2RAY(g_ui_theme.msg_user);
+    case MSG_ASSISTANT: return UI2RAY(g_ui_theme.msg_assistant);
+    case MSG_SYSTEM: return UI2RAY(g_ui_theme.msg_system);
+    default: return UI2RAY(g_ui_theme.text);
     }
 }
 
@@ -170,6 +177,26 @@ void ui_sidebar_set_oneshot_context(char *context)
     if (oneshot_context)
         free(oneshot_context);
     oneshot_context = context;   // takes ownership (may be NULL)
+}
+
+char *ui_sidebar_take_oneshot_context(void)
+{
+    char *c = oneshot_context;   // transfers ownership to the caller (may be NULL)
+    oneshot_context = NULL;
+    return c;
+}
+
+void ui_sidebar_open_focused(void)
+{
+    sidebar_visible = true;
+    sidebar_focused = true;
+    input_editing   = true;
+    focus_lock_once = true;
+}
+
+void ui_sidebar_set_has_key(bool k)
+{
+    has_key = k;
 }
 
 // ------------------------------------------------------------------------------
@@ -284,7 +311,7 @@ bool ui_sidebar_draw(Font font, Rect bounds, char *out_prompt, int out_prompt_si
     Vector2 mouse = GetMousePosition();
     bool mouse_inside = point_in_rect(mouse, bounds);
 
-    DrawRectangle(bounds.x, bounds.y, bounds.w, bounds.h, (Color){28, 30, 34, 255});
+    DrawRectangle(bounds.x, bounds.y, bounds.w, bounds.h, UI2RAY(g_ui_theme.panel_bg));
 
     float font_size = 16.0f * s;
     float line_spacing = 20.0f * s;
@@ -304,10 +331,10 @@ bool ui_sidebar_draw(Font font, Rect bounds, char *out_prompt, int out_prompt_si
         history.h = (int)(40 * s);
 
     DrawTextEx(font, "Chat", (Vector2){bounds.x + margin, bounds.y + 16*s},
-               18.0f*s, 0, RAYWHITE);
+               18.0f*s, 0, UI2RAY(g_ui_theme.text));
     const char *subtitle = ui_sidebar_is_streaming() ? "streaming…" : "context-aware";
     DrawTextEx(font, subtitle, (Vector2){bounds.x + margin + 56*s, bounds.y + 19*s},
-               13.0f*s, 0, (Color){150, 155, 165, 255});
+               13.0f*s, 0, UI2RAY(g_ui_theme.subtitle));
 
     float text_w = (float)history.w - 20.0f*s;
     float button_h = 22.0f * s;
@@ -350,7 +377,7 @@ bool ui_sidebar_draw(Font font, Rect bounds, char *out_prompt, int out_prompt_si
 
         if (messages[i].reasoning[0]) {
             wrapped_text(font, messages[i].reasoning, (float)history.x, &y,
-                         text_w, 14.0f*s, 18.0f*s, (Color){140, 145, 155, 255}, true);
+                         text_w, 14.0f*s, 18.0f*s, UI2RAY(g_ui_theme.reasoning), true);
             y += 4.0f*s;
         }
 
@@ -361,10 +388,10 @@ bool ui_sidebar_draw(Font font, Rect bounds, char *out_prompt, int out_prompt_si
             Rectangle btn = {(float)history.x, y, 60.0f*s, button_h};
             bool hover = CheckCollisionPointRec(mouse, btn)
                       && point_in_rect(mouse, history);
-            DrawRectangleRec(btn, hover ? (Color){70, 120, 80, 255}
-                                        : (Color){50, 90, 60, 255});
+            DrawRectangleRec(btn, hover ? UI2RAY(g_ui_theme.run_button_hover)
+                                        : UI2RAY(g_ui_theme.run_button));
             DrawTextEx(font, "Run", (Vector2){btn.x + 14.0f*s, btn.y + 3.0f*s},
-                       15.0f*s, 0, RAYWHITE);
+                       15.0f*s, 0, UI2RAY(g_ui_theme.text));
             if (hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 run_clicked = true;
                 copy_text(run_cmd, (int)sizeof(run_cmd), messages[i].command);
@@ -397,7 +424,10 @@ bool ui_sidebar_draw(Font font, Rect bounds, char *out_prompt, int out_prompt_si
         input_bounds.y, (float)send_w, (float)input_h
     };
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+    if (focus_lock_once) {
+        // The click that opened the sidebar this frame must not unfocus it.
+        focus_lock_once = false;
+    } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         bool clicked_input = CheckCollisionPointRec(mouse, input_bounds);
         sidebar_focused = clicked_input || (mouse_inside && sidebar_focused);
         input_editing = clicked_input || (mouse_inside && input_editing);
@@ -412,40 +442,68 @@ bool ui_sidebar_draw(Font font, Rect bounds, char *out_prompt, int out_prompt_si
 
     bool enter_pressed = sidebar_focused && IsKeyPressed(KEY_ENTER);
 
-    // JetBrains Mono is finer than RayGUI's default font — size the widgets to
-    // match the message body (16px). Save/restore so the settings modal is
-    // unaffected by this frame's change.
     int prev_text_size = GuiGetStyle(DEFAULT, TEXT_SIZE);
     GuiSetStyle(DEFAULT, TEXT_SIZE, (int)(16 * s));
-    if (GuiTextBox(input_bounds, input_text, INPUT_TEXT_SIZE, input_editing)) {
-        input_editing = !input_editing;
-        sidebar_focused = input_editing;
+
+    // E5 (§18): first-run card — show a setup card when there's no API key.
+    bool send_clicked = false;
+    if (!has_key && message_count == 0) {
+        // Draw a card instructing the user to set up an API key.
+        float card_y = (float)input_bounds.y - 90.0f * s;
+        Rectangle card_rect = {(float)input_bounds.x, card_y, (float)field_w, 80.0f * s};
+        DrawRectangleRounded(card_rect, 0.12f, 4, UI2RAY(g_ui_theme.panel_border));
+        DrawRectangleRoundedLinesEx(card_rect, 0.12f, 4, 1.0f,
+                                    UI2RAY(g_ui_theme.focus_border));
+        float tx = card_rect.x + 8.0f * s;
+        DrawTextEx(font, "Set a provider & key to use AI features.",
+                   (Vector2){tx, card_rect.y + 8.0f * s},
+                   14.0f * s, 0, UI2RAY(g_ui_theme.text));
+        DrawTextEx(font, "Open Ctrl+,  or set  FANGS_API_KEY  in your env.",
+                   (Vector2){tx, card_rect.y + 30.0f * s},
+                   13.0f * s, 0, UI2RAY(g_ui_theme.subtitle));
+        Rectangle open_btn = {tx, card_rect.y + 52.0f * s, 120.0f * s, 22.0f * s};
+        if (GuiButton(open_btn, "Open Settings")) {
+            // ui_settings_open() is the query; ui_settings_toggle() actually
+            // opens the modal. Only toggle when it's currently closed.
+            if (!ui_settings_open())
+                ui_settings_toggle();
+        }
+        // Still draw the input box but disabled-looking.
+        GuiTextBox(input_bounds, input_text, INPUT_TEXT_SIZE, false);
+    } else {
+        if (!has_key) {
+            // Has messages but no key — show a one-line warning above the input.
+            Rectangle warn_rect = {(float)input_bounds.x,
+                                   (float)input_bounds.y - 28.0f * s,
+                                   field_w, 22.0f * s};
+            DrawTextEx(font, "No API key — set FANGS_API_KEY or open Ctrl+, settings",
+                       (Vector2){warn_rect.x + 4.0f * s, warn_rect.y + 3.0f * s},
+                       13.0f * s, 0, UI2RAY(g_ui_theme.inline_error));
+        }
+        if (GuiTextBox(input_bounds, input_text, INPUT_TEXT_SIZE, input_editing)) {
+            input_editing = !input_editing;
+            sidebar_focused = input_editing;
+        }
+        send_clicked = show_send ? GuiButton(send_bounds, "Send") : false;
     }
-    bool send_clicked = show_send ? GuiButton(send_bounds, "Send") : false;
+
     GuiSetStyle(DEFAULT, TEXT_SIZE, prev_text_size);
 
     if (run_clicked && out_run && out_run_size > 0)
         copy_text(out_run, out_run_size, run_cmd);
 
-    if (ui_sidebar_should_submit(enter_pressed, send_clicked, input_text)) {
-        // Consume oneshot context: prepend it to the prompt if set.
-        if (oneshot_context) {
-            snprintf(out_prompt, (size_t)out_prompt_size, "%s\n---\n%s",
-                     oneshot_context, input_text);
-            free(oneshot_context);
-            oneshot_context = NULL;
-        } else {
-            copy_text(out_prompt, out_prompt_size, input_text);
-        }
+    // E5 (§18): don't submit when there's no API key.
+    if (has_key && ui_sidebar_should_submit(enter_pressed, send_clicked, input_text)) {
+        // out_prompt is the displayed question only. Any §15 block context is
+        // left for the host to take via ui_sidebar_take_oneshot_context() and
+        // pass to the model separately — so it neither bloats the chat bubble
+        // nor gets truncated into a fixed prompt buffer.
+        copy_text(out_prompt, out_prompt_size, input_text);
         input_text[0] = '\0';
         ui_sidebar_focus(true);
         scroll_offset = 1e9f;
         return true;
     }
-
-    // If the oneshot context was set but not yet consumed, offer a visual
-    // indication (draw a small indicator near the input box). No-op for now.
-    (void)consumed_oneshot;
 
     return false;
 }

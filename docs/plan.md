@@ -300,8 +300,10 @@ If either spike fails, we pivot here — having spent days, not weeks. **Both 0a
 
 ## 7.1 Post-v1 Enhancements
 
-> Two enhancements designed after the v1 feature set shipped. Spec: `spec.md` §15–§16.
-> **Sequencing: E1 first** (small, self-contained, high value), **then E2** (large). Both keep every
+> Enhancements designed after the v1 feature set shipped — the feature work E1–E2 (`spec.md` §15–§16)
+> and a polish round E3–E7 (`spec.md` §17–§21). **Sequencing: E1 first** (small, self-contained, high
+> value), **then E2** (large). The polish round is independent of E2 (tabs/splits are *not* part of it);
+> within it, **E3 first** — it's the keystone every other piece draws its colors from. All keep every
 > §2 invariant (pure PTY stream, no auto-exec) and leave the `term_engine` / `ai_provider` seams
 > untouched. Note: E2's per-`Session` refactor later makes E1's affordance pane-aware — a minor
 > follow-up called out in E2, not a blocker for E1.
@@ -355,6 +357,89 @@ today.
    independent shells that render/resize correctly; sidebar + inline target the focused pane;
    single tab/pane is pixel-identical to today; `session_tests` + `pane_tests` + extended
    `layout_tests` green; build warning-clean; all §2 invariants intact.
+
+---
+
+## 7.2 Polish Round (E3–E7)
+
+> Refinement of the shipped feature set — no new surfaces (tabs/splits are out). One thesis: the engine
+> is themed but the app chrome is not, text styling is faked while the engine already exposes the real
+> data, and failures only reach stderr. Spec: `spec.md` §17–§21. Handoff: `docs/handoff-polish.md`.
+> **Sequencing: E3 first** — it's the keystone every later piece draws its colors from — then E4–E7 in
+> any order by appetite. Each step adds its tests before host wiring (TDD), matching the v1 phases.
+
+### E3 — UI Theming (spec §17) — *keystone, do first*
+
+Every app-chrome pixel derives from the active `Theme` instead of hardcoded dark RGB, so light themes
+stop breaking and the app reads as one surface.
+
+1. **`ui_theme.{c,h}` (new, pure):** `UiTheme ui_theme_derive(const Theme *t)` → chrome colors blended
+   from `bg`/`fg` with `is_light` polarity (spec §17.2). No raylib/ghostty types in the header.
+2. **`tests/ui_theme_tests.c`** → `ctest` (TDD-first): legible contrast vs `bg`, selection ≠ bg, light
+   flips polarity, for a known light and dark theme.
+3. **Replace literals (spec §17.3):** `main.c` (selection, search box/hit, scrollbar, cursor alpha),
+   `ui_sidebar.c` (panel bg, role tints), `ui_settings.c` (modal bg), `ui_inline.c` (overlay/text),
+   `cmdblocks.c` (gutter/badge/button/accent) — convert `UiColor` → raylib `Color` at the draw site.
+4. **Recompute** the `UiTheme` on the existing theme-change path (initial load + `Ctrl+,` hot-reload).
+5. **Exit:** a light theme leaves sidebar/search/selection/scrollbar/cursor all readable; dark unchanged;
+   `ui_theme_tests` green; build warning-clean.
+
+### E4 — Crisp Text & Cursor (spec §18)
+
+Render the full `GhosttyStyle` + cursor state the engine already exposes; drop the faked bold/italic.
+
+1. **Real bold face:** add `assets/JetBrainsMono-Bold.ttf`; generalize the `bin2header` block in
+   `CMakeLists.txt` (~46–57) to emit `font_jetbrains_mono_bold.h`; load `bold_font` in `main.c` (~109)
+   and use it when `style.bold`; drop the draw-twice hack; `UnloadFont` in cleanup.
+2. **Decorations** in the cell loop: `underline` (single/double/curly via `GHOSTTY_SGR_UNDERLINE_*`,
+   honoring `underline_color`), `strikethrough`, `overline`, `faint` (blend toward bg), `invisible`
+   (skip glyph). All theme-fg colored.
+3. **Cursor state** (replace the flat block): render `BAR`/`BLOCK`/`UNDERLINE`/hollow from
+   `CURSOR_VISUAL_STYLE`; blink off a frame timer when `CURSOR_BLINKING`; `BLOCK_HOLLOW` when
+   `!IsWindowFocused()`.
+4. **Config:** add opt-in `cursor_style_default` + `cursor_blink` to `AppConfig` (defaults = today).
+5. **Exit:** SGR samples + `vim` render every decoration with real bold glyphs; cursor switches
+   style/blinks/hollows on focus loss; build warning-clean; suites green. (Visual verification; no new
+   test module.)
+
+### E5 — Error Surfacing & First-Run (spec §19)
+
+1. **`toast.{c,h}` (new):** bounded queue (`toast_push/tick/count/get`); enqueue/expire/cap logic pure,
+   drawing in `main.c` (fading pills, bottom-right, `UiTheme`-colored).
+2. **`tests/toast_tests.c`** → `ctest` (TDD-first): over-capacity drops oldest, TTL expiry, newest-first
+   with decreasing alpha.
+3. **Route failures:** the five stderr-only sites (`main.c` ~1748/1815/1826/2049/2481) + AI errors
+   (`ai_http.c`/`ui_sidebar.c`) also `toast_push`.
+4. **First-run card:** when no key resolves (reuse `resolve_api_key`), `ui_sidebar.c` shows a
+   connect-key card with a button into the settings modal instead of a dead input.
+5. **`docs/config.example`** (commented, every field + default) referenced from `README.md`.
+6. **Exit:** bad endpoint → error toast; corrupt config → load toast + defaults; no key → connect-key
+   card; `toast_tests` green; build warning-clean.
+
+### E6 — AI Sidebar Polish (spec §20)
+
+1. **Syntax-highlight fenced code** in replies (heuristic token tint, `UiTheme`-colored) during the
+   existing word-wrap pass.
+2. **Smooth streaming auto-scroll** (lerp toward bottom; yield to manual scroll-up).
+3. **Copy-whole-reply** button per assistant message.
+4. **"Ask AI about the last command"** keybinding (`Cmd+Shift+/`): find the latest `cmdblocks` block →
+   `ai_block_build_context()` (E1) → `ui_sidebar_set_oneshot_context()` + `ui_sidebar_prefill()` →
+   open/focus the sidebar. Redaction still applies; no auto-send.
+5. **Exit:** fenced replies render highlighted; streaming auto-scrolls and yields to scroll-up;
+   copy-reply works; the shortcut prefills the last block's context (no-op/toast when no blocks);
+   invariants intact; build warning-clean.
+
+### E7 — macOS Distribution & Window Polish (spec §21)
+
+1. **Notarization (gated on Apple Developer ID):** add Developer ID signing + hardened-runtime
+   entitlements + `notarytool submit --wait` + `stapler staple` to `scripts/macos-bundle.sh` /
+   `.github/workflows/release.yml`; drop the `xattr` caveat from `packaging/macos/fangs.rb`.
+   **Prereq:** paid Developer ID + app-specific password/API key + entitlements plist as CI secrets —
+   if unavailable, ship step 2 and leave a documented stub.
+2. **Window polish (no account):** persist + restore window size/position (replaces hardcoded `800×600`,
+   `main.c` ~1757); `SetMouseCursor` I-beam over text, pointer over buttons/links.
+3. **Exit:** relaunch restores window geometry; cursor changes on hover; if notarized,
+   `spctl -a -vvv build/Fangs.app` = accepted and a fresh download opens without the right-click dance.
 
 ---
 

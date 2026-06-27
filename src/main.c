@@ -16,23 +16,257 @@
 #include "context.h"
 #include "inline_cmd.h"
 #include "layout.h"
+#include "pane.h"
 #include "pty.h"
 #include "redact.h"
+#include "session.h"
 #include "term_engine.h"
 #include "theme.h"
 #include "ui_inline.h"
 #include "ui_sidebar.h"
 #include "ui_sidebar_model.h"
 #include "ui_settings.h"
+#include "ui_theme.h"
+#include "ui_toast.h"
+#include "ui_effects.h"
 
 // Font embedded into the binary at compile time (CMake bin2header from
-// assets/JetBrainsMono-Regular.ttf) — nothing to locate at runtime.
+// assets/JetBrainsMono-Regular.ttf and JetBrainsMono-Bold.ttf).
 #include "font_jetbrains_mono.h"
+#include "font_jetbrains_mono_bold.h"
 
 // Font-zoom (Ctrl +/-/0) bounds. Default matches config_defaults().
 #define FANGS_DEFAULT_FONT_SIZE 16
 #define FANGS_MIN_FONT_SIZE     6
 #define FANGS_MAX_FONT_SIZE     96
+
+// Max tabs (Cmd+1..9 selects tab N; 0 reserved).
+#define FANGS_MAX_TABS 9
+
+// Tab structure: owns a pane tree of terminal sessions.
+typedef struct {
+    PaneNode *root;
+    PaneNode *focused;
+    char title[64];
+} Tab;
+
+// App: the whole terminal window.
+typedef struct {
+    Tab tabs[FANGS_MAX_TABS];
+    int n_tabs;
+    int active;  // index into tabs[]
+} App;
+
+// Global App: owns all tabs and their pane trees of Sessions (§16.5).
+static App app = {0};
+
+// Pointer to the active session's CmdBlocks, kept in sync by
+// sync_active_session(). Used by feed_engine() and the draw loop.
+static CmdBlocks *g_cmdblocks = NULL;
+
+// ---------------------------------------------------------------------------
+// Pane-rect collector for multi-pane rendering (§16.4)
+// ---------------------------------------------------------------------------
+
+typedef struct { PaneNode *leaf; int x, y, w, h; } PaneRectEntry;
+
+typedef struct {
+    PaneRectEntry *entries;
+    int count, capacity;
+} PaneRectCollector;
+
+static void pane_rect_collect_cb(const PaneNode *n, int x, int y, int w, int h, void *user)
+{
+    PaneRectCollector *c = (PaneRectCollector *)user;
+    if (c->count < c->capacity) {
+        c->entries[c->count].leaf = (PaneNode *)n;
+        c->entries[c->count].x = x;
+        c->entries[c->count].y = y;
+        c->entries[c->count].w = w;
+        c->entries[c->count].h = h;
+        c->count++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session handle mgmt
+// ---------------------------------------------------------------------------
+
+// Re-extract the active session's handles into the main-loop locals.
+// Call on tab switch, pane split/close/focus change, and at startup.
+// Returns the active Session*, or NULL if no tab/session exists.
+// Also updates the module-global g_cmdblocks pointer.
+static Session *sync_active_session(TermEngine **te_out,
+                                     int *pty_fd_out, pid_t *child_out,
+                                     bool *child_exited_out)
+{
+    if (app.n_tabs < 1 || app.active < 0 || app.active >= app.n_tabs) {
+        g_cmdblocks = NULL;
+        if (te_out) *te_out = NULL;
+        if (pty_fd_out) *pty_fd_out = -1;
+        if (child_out) *child_out = -1;
+        if (child_exited_out) *child_exited_out = true;
+        return NULL;
+    }
+    Tab *tab = &app.tabs[app.active];
+    if (!tab->focused)
+        tab->focused = pane_first_leaf(tab->root);
+    PaneNode *leaf = tab->focused;
+    if (!leaf || leaf->kind != PANE_LEAF) {
+        leaf = pane_first_leaf(tab->root);
+        tab->focused = leaf;
+    }
+    if (!leaf) {
+        g_cmdblocks = NULL;
+        if (te_out) *te_out = NULL;
+        if (pty_fd_out) *pty_fd_out = -1;
+        if (child_out) *child_out = -1;
+        if (child_exited_out) *child_exited_out = true;
+        return NULL;
+    }
+    Session *s = leaf->leaf.session;
+    g_cmdblocks = (CmdBlocks *)session_cmdblocks(s);
+    if (te_out)      *te_out      = (TermEngine *)session_engine(s);
+    if (pty_fd_out)  *pty_fd_out  = session_pty_fd(s);
+    if (child_out)   *child_out   = session_child_pid(s);
+    if (child_exited_out) *child_exited_out = !session_child_alive(s);
+    return s;
+}
+
+// Initialize the App with a single tab containing one leaf Session.
+// Returns the Session pointer for handle extraction, or NULL on failure.
+static Session *app_init_first_tab(uint16_t cols, uint16_t rows,
+                                    int cell_w, int cell_h,
+                                    int max_scrollback)
+{
+    Session *s = session_create(cols, rows, cell_w, cell_h, max_scrollback, NULL);
+    if (!s) return NULL;
+
+    Tab *tab = &app.tabs[0];
+    tab->root    = pane_leaf(s);
+    tab->focused = tab->root;
+    snprintf(tab->title, sizeof(tab->title), "1");
+    app.n_tabs  = 1;
+    app.active  = 0;
+    return s;
+}
+
+// Switch to a different tab. Returns the new active Session*, or NULL.
+static Session *app_switch_tab(int idx, TermEngine **te, int *pty_fd,
+                                pid_t *child, bool *child_exited)
+{
+    if (idx < 0 || idx >= app.n_tabs || idx == app.active)
+        return sync_active_session(te, pty_fd, child, child_exited);
+    app.active = idx;
+    return sync_active_session(te, pty_fd, child, child_exited);
+}
+
+// Add a new empty tab with an initial Session.
+static Session *app_add_tab(uint16_t cols, uint16_t rows,
+                             int cell_w, int cell_h,
+                             int max_scrollback, const char *cwd,
+                             TermEngine **te, int *pty_fd,
+                             pid_t *child, bool *child_exited)
+{
+    if (app.n_tabs >= FANGS_MAX_TABS) return NULL;
+
+    Session *s = session_create(cols, rows, cell_w, cell_h, max_scrollback, cwd);
+    if (!s) return NULL;
+
+    Tab *tab = &app.tabs[app.n_tabs];
+    tab->root    = pane_leaf(s);
+    tab->focused = tab->root;
+    snprintf(tab->title, sizeof(tab->title), "%d", app.n_tabs + 1);
+    app.n_tabs++;
+    app.active = app.n_tabs - 1;  // switch to the new tab
+    return sync_active_session(te, pty_fd, child, child_exited);
+}
+
+// Close the active tab or focused pane in it.
+static bool app_close_active(void)
+{
+    if (app.n_tabs <= 0) return false;
+
+    Tab *tab = &app.tabs[app.active];
+    if (!tab->root) {
+        // Empty tab; remove it.
+        for (int i = app.active; i < app.n_tabs - 1; i++)
+            app.tabs[i] = app.tabs[i + 1];
+        app.n_tabs--;
+        if (app.active >= app.n_tabs) app.active = app.n_tabs - 1;
+        if (app.active < 0) app.active = 0;
+        return true;
+    }
+
+    // If the focused pane is the only leaf, close the whole tab.
+    PaneNode *focused = tab->focused;
+    if (pane_count_leaves(tab->root) <= 1 || !focused) {
+        // Destroy the pane tree and clear the tab.
+        pane_destroy(tab->root);
+        tab->root = NULL;
+        tab->focused = NULL;
+        // Remove the tab from the array.
+        for (int i = app.active; i < app.n_tabs - 1; i++)
+            app.tabs[i] = app.tabs[i + 1];
+        app.n_tabs--;
+        if (app.active >= app.n_tabs) app.active = app.n_tabs - 1;
+        if (app.active < 0) app.active = 0;
+        return true;
+    }
+
+    // Close the focused pane in a multi-pane tab.
+    PaneNode *new_focus = NULL;
+    PaneNode *new_root = pane_close(tab->root, focused, &new_focus);
+    tab->root = new_root;
+    tab->focused = new_focus ? new_focus : pane_first_leaf(new_root);
+    return true;
+}
+
+// Split the focused pane of the active tab.
+static Session *app_split_focused(PaneKind dir, uint16_t cols, uint16_t rows,
+                                   int cell_w, int cell_h,
+                                   int max_scrollback, const char *cwd,
+                                   TermEngine **te, int *pty_fd,
+                                   pid_t *child, bool *child_exited)
+{
+    if (app.n_tabs <= 0) return NULL;
+    Tab *tab = &app.tabs[app.active];
+    if (!tab->root || !tab->focused) return NULL;
+
+    Session *new_s = session_create(cols, rows, cell_w, cell_h, max_scrollback, cwd);
+    if (!new_s) return NULL;
+
+    PaneNode *new_root = pane_split(tab->root, tab->focused, dir, new_s, 0.5f);
+    tab->root = new_root;
+
+    // Focus follows to the newly created pane (the leaf owning new_s).
+    PaneNode *leaves[FANGS_MAX_TABS > 64 ? FANGS_MAX_TABS : 64];
+    int nl = 0;
+    pane_collect_leaves(new_root, leaves, (int)(sizeof(leaves)/sizeof(leaves[0])), &nl);
+    tab->focused = pane_first_leaf(new_root);
+    for (int i = 0; i < nl; i++) {
+        if (leaves[i]->kind == PANE_LEAF && leaves[i]->leaf.session == new_s) {
+            tab->focused = leaves[i];
+            break;
+        }
+    }
+
+    return sync_active_session(te, pty_fd, child, child_exited);
+}
+
+// Destroy all tabs and their pane-trees.
+static void app_destroy_all(void)
+{
+    for (int i = 0; i < app.n_tabs; i++) {
+        if (app.tabs[i].root) {
+            pane_destroy(app.tabs[i].root);
+            app.tabs[i].root = NULL;
+            app.tabs[i].focused = NULL;
+        }
+    }
+    app.n_tabs = 0;
+    app.active = 0;
+}
 
 // Snap a raw scale factor to the nearest 0.25 step (1.49 -> 1.50, 1.62 -> 1.50).
 static float snap_quarter(float v)
@@ -1062,7 +1296,7 @@ static int draw_search_highlights(int pad, int cell_width, int cell_height)
             int c1 = col_of_byte(r, m + qlen - 1);
             for (int c = c0; c <= c1; c++)
                 DrawRectangle(pad + c * cell_width, pad + r * cell_height,
-                              cell_width, cell_height, (Color){235, 200, 90, 120});
+                              cell_width, cell_height, UI2RAY(g_ui_theme.search_hit));
             total++;
             from = m + qlen;
         }
@@ -1092,29 +1326,33 @@ static void draw_search_box(Font font, int term_area_w, int matches)
     int x = term_area_w - w - 16;
     if (x < 8) x = 8;
     int y = 12;
-    DrawRectangle(x, y, w, h, (Color){32, 34, 40, 240});
-    DrawRectangleLines(x, y, w, h, (Color){90, 95, 105, 255});
+    DrawRectangle(x, y, w, h, UI2RAY(g_ui_theme.search_bg));
+    DrawRectangleLines(x, y, w, h, UI2RAY(g_ui_theme.search_border));
     char label[200];
     snprintf(label, sizeof(label), "Find: %s", g_search_query);
-    DrawTextEx(font, label, (Vector2){(float)x + 10, (float)y + 8}, 16.0f, 0, RAYWHITE);
+    DrawTextEx(font, label, (Vector2){(float)x + 10, (float)y + 8}, 16.0f, 0,
+               UI2RAY(g_ui_theme.search_text));
     char cnt[32];
     snprintf(cnt, sizeof(cnt), "%d", matches);
     Vector2 cs = MeasureTextEx(font, cnt, 14.0f, 0);
     DrawTextEx(font, cnt, (Vector2){(float)x + w - cs.x - 10, (float)y + 10}, 14.0f, 0,
-               (Color){150, 155, 165, 255});
+               UI2RAY(g_ui_theme.search_count));
 }
 
 static void render_terminal(GhosttyRenderState render_state,
                             GhosttyRenderStateRowIterator row_iter,
                             GhosttyRenderStateRowCells cells,
-                            Font font,
+                            Font font, Font bold_font,
                             int cell_width, int cell_height,
                             int font_size,
                             int pad,
                             int term_area_w,
                             const GhosttyTerminalScrollbar *scrollbar,
                             GhosttyTerminal terminal,
-                            GhosttyKittyGraphicsPlacementIterator placement_iter)
+                            GhosttyKittyGraphicsPlacementIterator placement_iter,
+                            int origin_x, int origin_y,
+                            AppConfig *cfg,
+                            int frame_count)
 {
     // Grab colors (palette, default fg/bg) from the render state so we
     // can resolve palette-indexed cell colors.
@@ -1145,8 +1383,8 @@ static void render_terminal(GhosttyRenderState render_state,
                             GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG);
     }
 
-    // Small padding from the window edges.
-    int y = pad;
+    // Small padding from the pane rect edges.
+    int y = origin_y + pad;
 
     while (ghostty_render_state_row_iterator_next(row_iter)) {
         // Get the cells for this row (reuses the same cells handle).
@@ -1154,11 +1392,11 @@ static void render_terminal(GhosttyRenderState render_state,
                 GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) != GHOSTTY_SUCCESS)
             continue;
 
-        int x = pad;
+        int x = origin_x + pad;
 
         while (ghostty_render_state_row_cells_next(cells)) {
-            int sel_row = (y - pad) / cell_height;
-            int sel_col = (x - pad) / cell_width;
+            int sel_row = (y - (origin_y + pad)) / cell_height;
+            int sel_col = (x - (origin_x + pad)) / cell_width;
             bool cell_selected = sel_contains(sel_row, sel_col);
 
             // How many codepoints make up the grapheme? 0 = empty cell.
@@ -1180,7 +1418,7 @@ static void render_terminal(GhosttyRenderState render_state,
                 }
 
                 if (cell_selected) {
-                    DrawRectangle(x, y, cell_width, cell_height, (Color){120, 145, 205, 90});
+                    DrawRectangle(x, y, cell_width, cell_height, UI2RAY(g_ui_theme.selection));
                     sel_capture(sel_row, " ", 1);
                 }
                 row_capture(sel_row, sel_col, " ", 1);
@@ -1242,7 +1480,7 @@ static void render_terminal(GhosttyRenderState render_state,
             }
 
             if (cell_selected) {
-                DrawRectangle(x, y, cell_width, cell_height, (Color){120, 145, 205, 90});
+                DrawRectangle(x, y, cell_width, cell_height, UI2RAY(g_ui_theme.selection));
                 sel_capture(sel_row, text, pos);
             }
             row_capture(sel_row, sel_col, text, pos);
@@ -1252,13 +1490,45 @@ static void render_terminal(GhosttyRenderState render_state,
             // looks reasonable at any scale.
             int italic_offset = style.italic ? (font_size / 6) : 0;
 
-            DrawTextEx(font, text, (Vector2){x + italic_offset, y}, font_size, 0, ray_fg);
+            // Bold: use the real bold font face when style.bold is set.
+            // JetBrains Mono Bold shares the regular advance width, so the
+            // grid does not shift. (§E4)
+            Font draw_font = (style.bold && bold_font.texture.id != 0) ? bold_font : font;
+            DrawTextEx(draw_font, text, (Vector2){x + italic_offset, y}, font_size, 0, ray_fg);
 
-            // Bold: draw the text a second time shifted 1 pixel to the
-            // right to thicken the strokes ("fake bold").
-            if (style.bold) {
-                DrawTextEx(font, text, (Vector2){x + italic_offset + 1, y}, font_size, 0, ray_fg);
+            // Faint: overlay a semi-transparent bg-colored rectangle to
+            // desaturate the glyph toward the background.
+            if (style.faint) {
+                Color fade_color = (Color){ bg_rgb.r, bg_rgb.g, bg_rgb.b, 140 };
+                DrawRectangle(x, y, cell_width, cell_height, fade_color);
             }
+
+            // Invisible: hide the text by drawing the background over it.
+            if (style.invisible) {
+                Color hide = (Color){ bg_rgb.r, bg_rgb.g, bg_rgb.b, 255 };
+                DrawRectangle(x, y, cell_width, cell_height, hide);
+            }
+
+            // Underline: pick underline_color if set, else fg.
+            Color deco_color = ray_fg;
+            if (style.underline != GHOSTTY_SGR_UNDERLINE_NONE) {
+                if (style.underline_color.tag == GHOSTTY_STYLE_COLOR_RGB)
+                    deco_color = (Color){ style.underline_color.value.rgb.r,
+                                          style.underline_color.value.rgb.g,
+                                          style.underline_color.value.rgb.b, 255 };
+                int uy = y + cell_height - 2;
+                if (style.underline == GHOSTTY_SGR_UNDERLINE_DOUBLE)
+                    DrawRectangle(x, uy - 2, cell_width, 1, deco_color);
+                DrawRectangle(x, uy, cell_width, 1, deco_color);
+            }
+
+            // Strikethrough: a horizontal line through the middle of the cell.
+            if (style.strikethrough)
+                DrawRectangle(x, y + cell_height / 2, cell_width, 1, ray_fg);
+
+            // Overline: a line at the top of the cell.
+            if (style.overline)
+                DrawRectangle(x, y, cell_width, 1, ray_fg);
 
             x += cell_width;
         }
@@ -1282,29 +1552,73 @@ static void render_terminal(GhosttyRenderState render_state,
                             GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT);
     }
 
-    // Draw the cursor.
-    bool cursor_visible = false;
-    ghostty_render_state_get(render_state,
-        GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &cursor_visible);
-    bool cursor_in_viewport = false;
-    ghostty_render_state_get(render_state,
-        GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &cursor_in_viewport);
-
-    if (cursor_visible && cursor_in_viewport) {
-        uint16_t cx = 0, cy = 0;
+    // Draw the cursor with proper visual style, blink, and focus-loss
+    // hollow rendering (§E4).  Reads CURSOR_VISUAL_STYLE, CURSOR_BLINKING,
+    // and CURSOR_PASSWORD_INPUT from the engine (ghostty/vt/render.h).
+    {
+        bool cursor_visible = false;
         ghostty_render_state_get(render_state,
-            GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &cx);
+            GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &cursor_visible);
+        bool cursor_in_viewport = false;
         ghostty_render_state_get(render_state,
-            GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cy);
+            GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &cursor_in_viewport);
 
-        // Draw the cursor using the foreground color (or explicit cursor
-        // color if the terminal set one).
-        GhosttyColorRgb cur_rgb = colors.foreground;
-        if (colors.cursor_has_value)
-            cur_rgb = colors.cursor;
-        int cur_x = pad + cx * cell_width;
-        int cur_y = pad + cy * cell_height;
-        DrawRectangle(cur_x, cur_y, cell_width, cell_height, (Color){ cur_rgb.r, cur_rgb.g, cur_rgb.b, 128 });
+        if (cursor_in_viewport) {
+            uint16_t cx = 0, cy = 0;
+            ghostty_render_state_get(render_state,
+                GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &cx);
+            ghostty_render_state_get(render_state,
+                GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cy);
+
+            GhosttyColorRgb cur_rgb = colors.foreground;
+            if (colors.cursor_has_value)
+                cur_rgb = colors.cursor;
+
+            int cur_x = origin_x + pad + cx * cell_width;
+            int cur_y = origin_y + pad + cy * cell_height;
+            bool focused = IsWindowFocused();
+
+            // Read visual style and blink from the engine.
+            int  vstyle = (int)GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK;
+            uint32_t vstyle_u32 = (uint32_t)GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK;
+            if (ghostty_render_state_get(render_state,
+                    GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE, &vstyle_u32) == GHOSTTY_SUCCESS)
+                vstyle = (int)vstyle_u32;
+            bool blinking = false;
+            uint32_t blink_u32 = 0;
+            if (ghostty_render_state_get(render_state,
+                    GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING, &blink_u32) == GHOSTTY_SUCCESS)
+                blinking = (blink_u32 != 0);
+
+            // Determine blink phase (~500 ms on/off at 60 fps).
+            bool blink_on = true;
+            if (blinking && cfg->cursor_blink && focused)
+                blink_on = (frame_count / 30) % 2 == 0;
+
+            // Window unfocused → always hollow outline.
+            if (!focused) {
+                Color hollow = { cur_rgb.r, cur_rgb.g, cur_rgb.b, 200 };
+                DrawRectangleLines(cur_x, cur_y, cell_width, cell_height, hollow);
+            } else if (cursor_visible && blink_on) {
+                Color cur_color = { cur_rgb.r, cur_rgb.g, cur_rgb.b, g_ui_theme.cursor_alpha };
+
+                switch (vstyle) {
+                    case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
+                    default:
+                        DrawRectangle(cur_x, cur_y, cell_width, cell_height, cur_color);
+                        break;
+                    case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+                        DrawRectangle(cur_x, cur_y, 2, cell_height, cur_color);
+                        break;
+                    case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+                        DrawRectangle(cur_x, cur_y + cell_height - 3, cell_width, 3, cur_color);
+                        break;
+                    case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
+                        DrawRectangleLines(cur_x, cur_y, cell_width, cell_height, cur_color);
+                        break;
+                }
+            }
+        }
     }
 
     // --- Layer 3: images above text (z >= 0) ---
@@ -1315,29 +1629,29 @@ static void render_terminal(GhosttyRenderState render_state,
     }
 
     // Draw the scrollbar when there is scrollback content to scroll through.
+    // The scrollbar thumb spans the pane height (or the full screen height
+    // for a single-pane layout).
     if (scrollbar && scrollbar->total > scrollbar->len) {
-        int scr_h = GetScreenHeight();
+        // Use the pane rect's height; fall back to GetScreenHeight() for
+        // backwards compatibility (the caller may pass origin_y=0 for the
+        // focused leaf in a classic single-pane layout).
+        int scr_h = GetScreenHeight() - origin_y;
 
-        // Scrollbar track spans the full window height; the thumb
-        // is proportional to the visible fraction of the total content.
         const int bar_width = 6;
         const int bar_margin = 2;
-        int bar_x = term_area_w - bar_width - bar_margin;
+        int bar_x = origin_x + term_area_w - bar_width - bar_margin;
 
         double visible_frac = (double)scrollbar->len / (double)scrollbar->total;
         int thumb_height = (int)(scr_h * visible_frac);
         if (thumb_height < 10) thumb_height = 10;
 
-        // Offset: 0 = scrolled all the way up (oldest), total-len =
-        // bottom (most recent).  Map to y so bottom-of-viewport aligns
-        // with the bottom of the track.
         double scroll_frac = (scrollbar->total > scrollbar->len)
             ? (double)scrollbar->offset / (double)(scrollbar->total - scrollbar->len)
             : 1.0;
-        int thumb_y = (int)(scroll_frac * (scr_h - thumb_height));
+        int thumb_y = origin_y + (int)(scroll_frac * (scr_h - thumb_height));
 
         DrawRectangle(bar_x, thumb_y, bar_width, thumb_height,
-                      (Color){ 200, 200, 200, 128 });
+                      UI2RAY(g_ui_theme.scrollbar));
     }
 
     // Reset global dirty state so the next update reports changes accurately.
@@ -1415,113 +1729,14 @@ static bool decode_png(void *userdata,
 // Effects callbacks
 // ---------------------------------------------------------------------------
 
-// Context passed through the terminal's userdata pointer to all effect
-// callbacks so they can reach the pty fd (and anything else they need)
-// without global state.
-typedef struct {
-    int pty_fd;
-    int cell_width;
-    int cell_height;
-    uint16_t cols;
-    uint16_t rows;
-} EffectsContext;
-
-// write_pty effect — the terminal calls this whenever a VT sequence
-// requires a response back to the application (device status reports,
-// mode queries, device attributes, etc.).  Without this, programs like
-// vim and tmux that probe terminal capabilities would hang.
-static void effect_write_pty(GhosttyTerminal terminal, void *userdata,
-                             const uint8_t *data, size_t len)
-{
-    (void)terminal;
-    EffectsContext *ctx = (EffectsContext *)userdata;
-    pty_write(ctx->pty_fd, (const char *)data, len);
-}
-
-// size effect — responds to XTWINOPS size queries (CSI 14/16/18 t)
-// so programs can discover the terminal geometry in cells and pixels.
-static bool effect_size(GhosttyTerminal terminal, void *userdata,
-                        GhosttySizeReportSize *out_size)
-{
-    (void)terminal;
-    EffectsContext *ctx = (EffectsContext *)userdata;
-    out_size->rows = ctx->rows;
-    out_size->columns = ctx->cols;
-    out_size->cell_width = (uint32_t)ctx->cell_width;
-    out_size->cell_height = (uint32_t)ctx->cell_height;
-    return true;
-}
-
-// device_attributes effect — responds to DA1/DA2/DA3 queries so
-// terminal applications can identify the terminal's capabilities.
-// We report VT220-level conformance with a modest feature set.
-static bool effect_device_attributes(GhosttyTerminal terminal, void *userdata,
-                                     GhosttyDeviceAttributes *out_attrs)
-{
-    (void)terminal;
-    (void)userdata;
-
-    // DA1: VT220-level with a few common features.
-    out_attrs->primary.conformance_level = GHOSTTY_DA_CONFORMANCE_VT220;
-    out_attrs->primary.features[0] = GHOSTTY_DA_FEATURE_COLUMNS_132;
-    out_attrs->primary.features[1] = GHOSTTY_DA_FEATURE_SELECTIVE_ERASE;
-    out_attrs->primary.features[2] = GHOSTTY_DA_FEATURE_ANSI_COLOR;
-    out_attrs->primary.num_features = 3;
-
-    // DA2: VT220-type, version 1, no ROM cartridge.
-    out_attrs->secondary.device_type = GHOSTTY_DA_DEVICE_TYPE_VT220;
-    out_attrs->secondary.firmware_version = 1;
-    out_attrs->secondary.rom_cartridge = 0;
-
-    // DA3: arbitrary unit id.
-    out_attrs->tertiary.unit_id = 0;
-
-    return true;
-}
-
-// xtversion effect — responds to CSI > q with our application name.
-static GhosttyString effect_xtversion(GhosttyTerminal terminal, void *userdata)
-{
-    (void)terminal;
-    (void)userdata;
-    return (GhosttyString){ .ptr = (const uint8_t *)"fangs", .len = 5 };
-}
-
-// title_changed effect — updates the raylib window title whenever the
-// terminal receives an OSC 0 or OSC 2 title-setting sequence.
-static void effect_title_changed(GhosttyTerminal terminal, void *userdata)
-{
-    (void)userdata;
-    GhosttyString title = {0};
-    if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_TITLE, &title) != GHOSTTY_SUCCESS)
-        return;
-
-    // SetWindowTitle expects a NUL-terminated string, so copy into a
-    // stack buffer.  Truncate quietly if the title is absurdly long.
-    char buf[256];
-    size_t len = title.len < sizeof(buf) - 1 ? title.len : sizeof(buf) - 1;
-    memcpy(buf, title.ptr, len);
-    buf[len] = '\0';
-    SetWindowTitle(buf);
-}
-
-// color_scheme effect — responds to CSI ? 996 n.  Raylib has no API to
-// query the OS color scheme, so we return false to silently ignore the
-// query rather than guessing.
-static bool effect_color_scheme(GhosttyTerminal terminal, void *userdata,
-                                GhosttyColorScheme *out_scheme)
-{
-    (void)terminal;
-    (void)userdata;
-    (void)out_scheme;
-    return false;
-}
+// (EffectsContext, effect callbacks, register_session_effects, and
+// update_session_effects moved to ui_effects.c — included above.)
 
 // Reload the terminal font at the given *logical* size (applying the current
 // content scale via load_terminal_font), then recompute cell metrics, the grid,
 // and the pty winsize. Shared by font-size changes (settings/zoom) and
 // content-scale changes (window dragged to a differently-scaled monitor).
-static bool rebuild_terminal_font(Font *font, int font_size,
+static bool rebuild_terminal_font(Font *font, Font *bold_font, int font_size,
                                   int *cell_width, int *cell_height,
                                   uint16_t *term_cols, uint16_t *term_rows,
                                   int term_area_w, int pad,
@@ -1536,6 +1751,20 @@ static bool rebuild_terminal_font(Font *font, int font_size,
     UnloadFont(*font);
     *font = new_font;
     GuiSetFont(*font);              // keep RayGUI on the freshly reloaded font
+
+    // Reload bold variant at the same logical size.
+    if (bold_font && bold_font->texture.id != 0)
+        UnloadFont(*bold_font);
+    if (bold_font) {
+        Vector2 dpi_scale = fangs_content_scale();
+        int font_size_px = (int)(font_size * dpi_scale.y);
+        if (font_size_px < 1) font_size_px = 1;
+        *bold_font = LoadFontFromMemory(".ttf", font_jetbrains_mono_bold,
+                           (int)sizeof(font_jetbrains_mono_bold), font_size_px, NULL, 0);
+        if (bold_font->texture.id != 0)
+            SetTextureFilter(bold_font->texture, TEXTURE_FILTER_BILINEAR);
+    }
+
     *cell_width = new_cell_width;
     *cell_height = new_cell_height;
 
@@ -1547,8 +1776,10 @@ static bool rebuild_terminal_font(Font *font, int font_size,
     return true;
 }
 
+// (declared in ui_effects.h)
+
 static bool apply_config(const AppConfig *cfg,
-                         Font *font,
+                         Font *font, Font *bold_font,
                          int *font_size,
                          int *cell_width,
                          int *cell_height,
@@ -1556,21 +1787,20 @@ static bool apply_config(const AppConfig *cfg,
                          uint16_t *term_rows,
                          int term_area_w,
                          int pad,
-                         TermEngine *te,
-                         int pty_fd,
-                         EffectsContext *effects_ctx)
+                         Session *s)
 {
+    TermEngine *te = (TermEngine *)session_engine(s);
+    int pty_fd = session_pty_fd(s);
+    if (!te || pty_fd < 0) return false;
+
     if (cfg->font_size != *font_size) {
-        if (!rebuild_terminal_font(font, cfg->font_size, cell_width, cell_height,
+        if (!rebuild_terminal_font(font, bold_font, cfg->font_size, cell_width, cell_height,
                                    term_cols, term_rows, term_area_w, pad, te, pty_fd))
             return false;
         *font_size = cfg->font_size;
     }
 
-    effects_ctx->cell_width = *cell_width;
-    effects_ctx->cell_height = *cell_height;
-    effects_ctx->cols = *term_cols;
-    effects_ctx->rows = *term_rows;
+    update_session_effects(s, *term_cols, *term_rows, *cell_width, *cell_height);
     return true;
 }
 
@@ -1578,12 +1808,18 @@ static bool apply_config(const AppConfig *cfg,
 // Main
 // ---------------------------------------------------------------------------
 
-// Sink for pty_read: feed drained PTY bytes straight into the VT engine.
+// (declared in ui_effects.h)
+
+// Sink for pty_read: feed drained PTY bytes through the cmdblocks OSC-133
+// observer, which forwards every byte to the VT engine unchanged while tracking
+// command boundaries for the block overlay.
 static void feed_engine(void *userdata, const uint8_t *data, size_t len)
 {
-    // Tracks OSC-133 command boundaries while forwarding every byte to the
-    // engine unchanged (command-block overlay; see cmdblocks.c).
-    cmdblocks_feed((TermEngine *)userdata, data, len);
+    TermEngine *te = (TermEngine *)userdata;
+    if (g_cmdblocks)
+        cmdblocks_feed(g_cmdblocks, te, data, len);
+    else
+        term_engine_write(te, data, len);
 }
 
 // Resolve the AI key: FANGS_API_KEY env wins over the config file value.
@@ -1597,20 +1833,25 @@ static const char *resolve_api_key(const AppConfig *cfg)
 
 // Build and launch a streaming AI request for `prompt`, using redacted recent
 // terminal output as context. Returns NULL if there's no key or setup fails.
+// block_context (§15): when non-NULL, it is the already-redacted command-block
+// context and REPLACES the scrollback dump for this send. NULL → normal chat,
+// which captures the last ~120 redacted lines.
 static AiStream *start_ai_request(TermEngine *te, const AppConfig *cfg,
-                                  const char *prompt)
+                                  const char *prompt, const char *block_context)
 {
-    char *ctx = context_build(te, 120, 8192);   // last ~120 lines, redacted
+    char *ctx = block_context ? NULL : context_build(te, 120, 8192);  // redacted
+    const char *context_text = block_context ? block_context
+                             : (ctx ? ctx : "(none)");
     const char *sys =
         "You are a terminal assistant embedded in the user's terminal. Recent "
         "terminal output is provided as context. Answer concisely. If you "
         "recommend a command, put ONLY that command on a single line inside one "
         "```sh fenced block.";
 
-    size_t ulen = (ctx ? strlen(ctx) : 0) + strlen(prompt) + 64;
+    size_t ulen = strlen(context_text) + strlen(prompt) + 64;
     char *user = malloc(ulen);
     snprintf(user, ulen, "Recent terminal output:\n%s\n\nQuestion: %s",
-             ctx ? ctx : "(none)", prompt);
+             context_text, prompt);
 
     // system + recent conversation history + the augmented current question.
     enum { MAX_TURNS = 10 };
@@ -1738,14 +1979,48 @@ static void apply_gui_style(const Theme *t)
     GuiSetStyle(DEFAULT, TEXT_COLOR_DISABLED,   ColorToInt(dim));
 }
 
+// Apply config to all sessions in the active tab. Used by end-of-frame font
+// zoom and settings-save so every pane picks up theme/font changes.
+// Returns true if all sessions applied successfully.
+static bool apply_config_all_sessions(const AppConfig *cfg,
+                                       Font *font, Font *bold_font,
+                                       int *font_size,
+                                       int *cell_width, int *cell_height,
+                                       uint16_t *term_cols, uint16_t *term_rows,
+                                       int term_area_w, int pad)
+{
+    if (app.n_tabs <= 0 || app.active < 0) return false;
+    Tab *tab = &app.tabs[app.active];
+    if (!tab || !tab->root) return false;
+    PaneNode *leaves[64];
+    int n = 0;
+    pane_collect_leaves(tab->root, leaves, 64, &n);
+    bool ok = true;
+    for (int i = 0; i < n; i++) {
+        Session *s = leaves[i]->leaf.session;
+        if (!apply_config(cfg, font, bold_font, font_size, cell_width, cell_height,
+                          term_cols, term_rows, term_area_w, pad, s))
+            ok = false;
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+// (declared in ui_effects.h; no forward declaration needed.)
+
 int main(void)
 {
     log_build_info();
 
     AppConfig cfg;
     const char *config_path = config_default_path();
-    if (!config_load(&cfg, config_path))
+    if (!config_load(&cfg, config_path)) {
         fprintf(stderr, "warning: failed to load config at %s; using defaults\n", config_path);
+        toast_push(TOAST_WARN, "Failed to load config; using defaults.");
+    }
 
     int font_size = cfg.font_size;
 
@@ -1767,26 +2042,35 @@ int main(void)
     // here, before any worker thread exists, since it isn't thread-safe.
     ai_global_init();
 
-    // Engine + process handles. Initialized so cleanup frees only what
-    // succeeded.
-    TermEngine *te = NULL;
+    // App handles: sessions via tabs+panes, AI streams, accumulated data.
+    int exit_code = 0;
     AiStream *active_stream = NULL;   // in-flight sidebar AI request
     AiStream *inline_stream = NULL;   // in-flight inline (Ctrl+Space) request
     char inline_answer[8192] = "";    // accumulates the inline command reply
-    pid_t child = -1;
-    int pty_fd = -1;
-    int exit_code = 0;
-    bool child_exited = false;
-    bool child_reaped = false;
-    int child_exit_status = -1;
+
+    // g_cmdblocks is set by sync_active_session() per-frame; prime it NULL.
+    g_cmdblocks = NULL;
 
     int cell_width = 0;
     int cell_height = 0;
     Font mono_font = load_terminal_font(font_size, &cell_width, &cell_height);
     if (mono_font.texture.id == 0) {
         fprintf(stderr, "LoadFontFromMemory failed\n");
+        toast_push(TOAST_ERROR, "Failed to load terminal font.");
         exit_code = 1;
         goto cleanup;
+    }
+
+    // Load the bold variant for SGR bold rendering (§E4).
+    Font bold_font = {0};
+    {
+        Vector2 dpi_scale = fangs_content_scale();
+        int font_size_px = (int)(font_size * dpi_scale.y);
+        if (font_size_px < 1) font_size_px = 1;
+        bold_font = LoadFontFromMemory(".ttf", font_jetbrains_mono_bold,
+                           (int)sizeof(font_jetbrains_mono_bold), font_size_px, NULL, 0);
+        if (bold_font.texture.id != 0)
+            SetTextureFilter(bold_font.texture, TEXTURE_FILTER_BILINEAR);
     }
 
     // Use the terminal font for all RayGUI widgets + AI panels, so the AI
@@ -1818,18 +2102,25 @@ int main(void)
     // so the Kitty graphics protocol can accept PNG images.
     ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)decode_png);
 
-    // Create the VT engine (terminal + encoders + render state) behind the
-    // seam — the only place the host touches libghostty-vt's lifecycle.
-    te = term_engine_create(term_cols, term_rows, cell_width, cell_height,
-                            cfg.scrollback);
-    if (!te) {
-        fprintf(stderr, "term_engine_create failed\n");
+    // Initialise the first tab/session via the App (§16.5).
+    Session *s = app_init_first_tab(term_cols, term_rows, cell_width, cell_height,
+                                     cfg.scrollback);
+    if (!s) {
+        fprintf(stderr, "failed to create initial session\n");
+        toast_push(TOAST_ERROR, "Failed to create terminal session.");
         exit_code = 1;
         goto cleanup;
     }
+    register_session_effects(s);
 
-    // Borrow the engine's handles for the per-frame input/render code below.
-    // They are owned by the engine and must never be freed here.
+    // Borrow handles for the per-frame input/render code via the active session.
+    // sync_active_session() is called each frame to keep these current across
+    // tab switches and split changes.
+    TermEngine *te = NULL;
+    int pty_fd = -1;
+    pid_t child = -1;
+    bool child_exited = true;
+    sync_active_session(&te, &pty_fd, &child, &child_exited);
     GhosttyTerminal terminal = term_engine_terminal(te);
     GhosttyRenderState render_state = term_engine_render_state(te);
     GhosttyRenderStateRowIterator row_iter = term_engine_row_iter(te);
@@ -1840,40 +2131,8 @@ int main(void)
     GhosttyMouseEncoder mouse_encoder = term_engine_mouse_encoder(te);
     GhosttyMouseEvent mouse_event = term_engine_mouse_event(te);
 
-    // Spawn a child shell connected to a pseudo-terminal.
-    pty_fd = pty_spawn(&child, term_cols, term_rows, cell_width, cell_height);
-    if (pty_fd < 0) {
-        exit_code = 1;
-        goto cleanup;
-    }
-
-    // Register effects so the terminal can respond to VT queries (device
-    // attributes, mode reports, size queries, etc.) that programs like
-    // vim, tmux, and htop send during startup.  Without these, query
-    // sequences are silently dropped and those programs may hang or
-    // fall back to degraded behavior.
-    EffectsContext effects_ctx = {
-        .pty_fd = pty_fd,
-        .cell_width = cell_width,
-        .cell_height = cell_height,
-        .cols = term_cols,
-        .rows = term_rows,
-    };
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_USERDATA,
-        &effects_ctx);
-
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY,
-        (const void *)effect_write_pty);
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SIZE,
-        (const void *)effect_size);
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES,
-        (const void *)effect_device_attributes);
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_XTVERSION,
-        (const void *)effect_xtversion);
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
-        (const void *)effect_title_changed);
-    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
-        (const void *)effect_color_scheme);
+    bool child_reaped = false;
+    int child_exit_status = -1;
 
     // Track window size so we only recalculate the grid on actual changes.
     int prev_width = GetScreenWidth();
@@ -1904,9 +2163,11 @@ int main(void)
     bool blocks_smoke = (blocks_smoke_path && blocks_smoke_path[0] != '\0');
     bool blocks_smoke_started = false;
     int  blocks_smoke_frames = 0;
+    int frame_count = 0;
 
     // Each frame: handle resize → read pty → process input → render.
     while (!WindowShouldClose()) {
+        frame_count++;
         if (phase3_smoke && !phase3_smoke_started) {
             if (!ui_sidebar_visible())
                 ui_sidebar_toggle();
@@ -1930,7 +2191,7 @@ int main(void)
                 "\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\cargo test\r\n\x1b]133;C\x1b\\  error[E0382]: borrow of moved value: `cfg`\r\n  test result: FAILED. 1 passed; 1 failed\r\n\x1b]133;D;101\x1b\\"
                 "\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\git status\r\n\x1b]133;C\x1b\\  On branch main\r\n  nothing to commit, working tree clean\r\n\x1b]133;D;0\x1b\\"
                 "\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\";
-            cmdblocks_feed(te, (const uint8_t *)canned, sizeof(canned) - 1);
+            cmdblocks_feed(g_cmdblocks, te, (const uint8_t *)canned, sizeof(canned) - 1);
             blocks_smoke_started = true;
         }
 
@@ -1981,6 +2242,12 @@ int main(void)
         bool ctrl_down  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         bool shift_down = IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT);
         bool cmd_down   = IsKeyDown(KEY_LEFT_SUPER)   || IsKeyDown(KEY_RIGHT_SUPER);
+        bool alt_down   = IsKeyDown(KEY_LEFT_ALT)     || IsKeyDown(KEY_RIGHT_ALT);
+        // Tab/split/focus chords: Cmd on macOS, Ctrl+Shift on Linux. Plain
+        // Ctrl+<key> must reach the shell (Ctrl+D EOF, Ctrl+W word-erase,
+        // Ctrl+T transpose), so these never trigger on bare Ctrl — matching the
+        // copy/paste chords above.
+        bool tab_chord  = cmd_down || (ctrl_down && shift_down);
 
         // Command-block navigation: Cmd/Ctrl + Up/Down jumps between command
         // prompts (Warp-style). Intercepted before handle_input so the arrow
@@ -1988,8 +2255,8 @@ int main(void)
         bool block_nav_consumed = false;
         if ((cmd_down || ctrl_down) && !ui_settings_open() && !ui_inline_active()
             && !g_search_active && !ui_sidebar_focused()) {
-            if (IsKeyPressed(KEY_UP))   block_nav_consumed = cmdblocks_navigate(te, -1);
-            if (IsKeyPressed(KEY_DOWN)) block_nav_consumed = cmdblocks_navigate(te, +1);
+            if (IsKeyPressed(KEY_UP))   block_nav_consumed = cmdblocks_navigate(g_cmdblocks, te, -1);
+            if (IsKeyPressed(KEY_DOWN)) block_nav_consumed = cmdblocks_navigate(g_cmdblocks, te, +1);
         }
 
         // Clipboard: Ctrl+Shift+C/V (Linux) or Cmd+C/V (macOS); Shift+Insert pastes.
@@ -2045,11 +2312,94 @@ int main(void)
             if (new_size > FANGS_MAX_FONT_SIZE) new_size = FANGS_MAX_FONT_SIZE;
             if (new_size != cfg.font_size) {
                 cfg.font_size = new_size;
-                if (!config_save(&cfg, config_path))
+                if (!config_save(&cfg, config_path)) {
                     fprintf(stderr, "warning: failed to save config at %s\n", config_path);
+                    toast_push(TOAST_WARN, "Failed to save config (font zoom).");
+                }
                 apply_saved_config = true;
                 zoom_consumed = true;
                 while (GetCharPressed() != 0) { }  // drain '='/'-'/'+' text events
+            }
+        }
+
+        // Tab and split operations: Cmd+… (macOS) / Ctrl+Shift+… (Linux).
+        // Intercepted before handle_input so these key events never reach the
+        // shell — and gated on tab_chord so bare Ctrl+<key> still does.
+        if (tab_chord && !ui_settings_open() && !ui_inline_active()
+            && !g_search_active && !ui_sidebar_focused()) {
+
+            // --- New tab: Cmd/Ctrl+T ---
+            if (IsKeyPressed(KEY_T)) {
+                Session *cur = sync_active_session(&te, &pty_fd, &child, &child_exited);
+                app_add_tab(term_cols, term_rows, cell_width, cell_height,
+                            cfg.scrollback, session_cwd(cur),
+                            &te, &pty_fd, &child, &child_exited);
+                prev_term_area_w = -1;
+                while (GetCharPressed() != 0) { }
+            }
+
+            // --- Close focused pane / active tab: Cmd/Ctrl+W ---
+            if (IsKeyPressed(KEY_W)) {
+                app_close_active();
+                sync_active_session(&te, &pty_fd, &child, &child_exited);
+                prev_term_area_w = -1;
+                while (GetCharPressed() != 0) { }
+            }
+
+            // --- Tab switch: Cmd/Ctrl+1..9 ---
+            int tab_idx = -1;
+                 if (IsKeyPressed(KEY_ONE))   tab_idx = 0;
+            else if (IsKeyPressed(KEY_TWO))   tab_idx = 1;
+            else if (IsKeyPressed(KEY_THREE)) tab_idx = 2;
+            else if (IsKeyPressed(KEY_FOUR))  tab_idx = 3;
+            else if (IsKeyPressed(KEY_FIVE))  tab_idx = 4;
+            else if (IsKeyPressed(KEY_SIX))   tab_idx = 5;
+            else if (IsKeyPressed(KEY_SEVEN)) tab_idx = 6;
+            else if (IsKeyPressed(KEY_EIGHT)) tab_idx = 7;
+            else if (IsKeyPressed(KEY_NINE))  tab_idx = 8;
+            if (tab_idx >= 0) {
+                app_switch_tab(tab_idx, &te, &pty_fd, &child, &child_exited);
+                prev_term_area_w = -1;
+                while (GetCharPressed() != 0) { }
+            }
+
+            // --- Split D. Direction picker: on macOS Shift = vertical
+            // (Cmd+D horizontal, Cmd+Shift+D vertical, per spec §16.8); on
+            // Linux Shift is already part of the chord, so Alt = vertical
+            // (Ctrl+Shift+D horizontal, Ctrl+Shift+Alt+D vertical). ---
+            if (IsKeyPressed(KEY_D)) {
+                bool vertical = cmd_down ? shift_down : alt_down;
+                Session *cur = sync_active_session(&te, &pty_fd, &child, &child_exited);
+                app_split_focused(vertical ? PANE_VSPLIT : PANE_HSPLIT,
+                                  term_cols, term_rows, cell_width, cell_height,
+                                  cfg.scrollback, session_cwd(cur),
+                                  &te, &pty_fd, &child, &child_exited);
+                prev_term_area_w = -1;
+                while (GetCharPressed() != 0) { }
+            }
+        }
+
+        // --- Pane focus move: Cmd+Opt+Arrow (macOS) / Ctrl+Shift+Arrow (Linux).
+        // Only when the active tab has more than one pane, so single-pane users
+        // keep Ctrl+Shift+Arrow / modified arrows for their TUIs (§16.8). ---
+        bool focus_chord = (cmd_down && alt_down) || (ctrl_down && shift_down);
+        if (focus_chord && app.n_tabs > 0
+            && pane_count_leaves(app.tabs[app.active].root) > 1
+            && !ui_settings_open() && !ui_inline_active()
+            && !g_search_active && !ui_sidebar_focused()) {
+            int dx = 0, dy = 0;
+            if (IsKeyPressed(KEY_LEFT))       dx = -1;
+            else if (IsKeyPressed(KEY_RIGHT)) dx = 1;
+            else if (IsKeyPressed(KEY_UP))    dy = -1;
+            else if (IsKeyPressed(KEY_DOWN))  dy = 1;
+            if (dx != 0 || dy != 0) {
+                Tab *t = &app.tabs[app.active];
+                PaneNode *nf = pane_focus_move(t->root, t->focused, dx, dy);
+                if (nf) {
+                    t->focused = nf;
+                    sync_active_session(&te, &pty_fd, &child, &child_exited);
+                }
+                while (GetCharPressed() != 0) { }
             }
         }
 
@@ -2066,7 +2416,7 @@ int main(void)
         // the UI and layout are sized in logical px (see the 1.0f passed below).
         float ui_scale = fangs_content_scale().y;
         if (ui_scale != applied_scale) {
-            if (rebuild_terminal_font(&mono_font, font_size, &cell_width, &cell_height,
+            if (rebuild_terminal_font(&mono_font, &bold_font, font_size, &cell_width, &cell_height,
                                       &term_cols, &term_rows, term_area_w, pad, te, pty_fd)) {
                 applied_scale = ui_scale;
                 prev_term_area_w = -1;   // force the grid/winsize resync below
@@ -2082,15 +2432,42 @@ int main(void)
         if (w != prev_width || h != prev_height || term_area_w != prev_term_area_w) {
             compute_terminal_grid(term_area_w, pad, cell_width, cell_height,
                                   &term_cols, &term_rows);
-            term_engine_resize(te, term_cols, term_rows, cell_width, cell_height);
-            // Keep the effects context in sync so size queries report
-            // the current geometry.
-            effects_ctx.cols = term_cols;
-            effects_ctx.rows = term_rows;
-            pty_set_winsize(pty_fd, term_cols, term_rows, cell_width, cell_height);
+            // Resize all sessions in the active tab.
+            Tab *tab = &app.tabs[app.active];
+            PaneNode *leaves[64];
+            int n_leaves = 0;
+            pane_collect_leaves(tab->root, leaves, 64, &n_leaves);
+            for (int i = 0; i < n_leaves; i++) {
+                Session *ss = leaves[i]->leaf.session;
+                TermEngine *ste = (TermEngine *)session_engine(ss);
+                int spfd = session_pty_fd(ss);
+                term_engine_resize(ste, term_cols, term_rows, cell_width, cell_height);
+                update_session_effects(ss, term_cols, term_rows, cell_width, cell_height);
+                pty_set_winsize(spfd, term_cols, term_rows, cell_width, cell_height);
+            }
             prev_width = w;
             prev_height = h;
             prev_term_area_w = term_area_w;
+        }
+
+        // Drain PTY output from ALL sessions in the active tab and feed their
+        // VT engines. In blocks-smoke mode we ignore the real shell so the
+        // canned content renders without interleaving.
+        Session *active_session = sync_active_session(&te, &pty_fd, &child, &child_exited);
+        if (!active_session)
+            break;   // no sessions left — exit the app
+
+        if (!blocks_smoke) {
+            if (app.n_tabs > 0 && app.active >= 0) {
+                Tab *tab = &app.tabs[app.active];
+                PaneNode *leaves[64];
+                int n_leaves = 0;
+                pane_collect_leaves(tab->root, leaves, 64, &n_leaves);
+                for (int i = 0; i < n_leaves; i++) {
+                    Session *ss = leaves[i]->leaf.session;
+                    session_feed_pty(ss);
+                }
+            }
         }
 
         // Send focus in/out events when the window focus state changes,
@@ -2117,39 +2494,17 @@ int main(void)
             prev_focused = focused;
         }
 
-        // Drain any pending output from the shell and update terminal state.
-        // Once the child has exited we stop reading — the fd may be closed.
-        // In blocks-smoke mode we ignore the real shell so the canned content
-        // renders without interleaving.
-        if (!child_exited && !blocks_smoke) {
-            PtyReadResult pty_rc = pty_read(pty_fd, feed_engine, te);
-            if (pty_rc != PTY_READ_OK) {
-                // EOF or error — the child's side of the pty is closed.
-                child_exited = true;
-            }
-        }
-
-        // Try to reap the child each frame until we succeed.  The pty
-        // EOF can arrive before the child is waitable, so a single
-        // WNOHANG attempt right at EOF may miss.  We also check for
-        // signal death so the banner can report it properly.
-        if (child_exited && !child_reaped) {
-            int wstatus = 0;
-            pid_t wp = waitpid(child, &wstatus, WNOHANG);
-            if (wp > 0) {
-                child_reaped = true;
-                if (WIFEXITED(wstatus))
-                    child_exit_status = WEXITSTATUS(wstatus);
-                else if (WIFSIGNALED(wstatus))
-                    child_exit_status = 128 + WTERMSIG(wstatus);
-            }
-        }
+        // Reap the child if exited so the exit status is available for the
+        // banner and the auto-close check below.
+        if (!session_child_alive(active_session))
+            session_reap(active_session);
+        child_exit_status = session_exit_status(active_session);
 
         // A clean shell exit (the user typed `exit` or pressed Ctrl-D) should
         // close the window, just like any other terminal. Only an abnormal
         // exit — a non-zero status or a signal — keeps the window open with
         // the banner below so the user can scroll back and inspect output.
-        if (child_reaped && child_exit_status == 0)
+        if (!session_child_alive(active_session) && child_exit_status == 0)
             break;
 
         if (ui_sidebar_visible() && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
@@ -2221,18 +2576,39 @@ int main(void)
                              cell_width, cell_height, pad, term_area_w);
         }
 
-        // Apply the color theme to the engine when it changes (e.g. on Save).
-        // Setting the palette/default colors is a mutating call, so do it once
-        // per change rather than every frame.
+        // Apply the color theme when it changes (e.g. on Save). Setting the
+        // palette/default colors is a mutating call, so do it once per change.
+        // Apply to EVERY session in EVERY tab — not just the active pane — so
+        // background panes/tabs don't keep a stale palette (§16 × E3).
         if (strcmp(cfg.theme, applied_theme) != 0) {
             Theme th = theme_resolve(cfg.theme);
-            term_engine_apply_theme(te, &th);
+            for (int ti = 0; ti < app.n_tabs; ti++) {
+                PaneNode *tl[64];
+                int tln = 0;
+                pane_collect_leaves(app.tabs[ti].root, tl, 64, &tln);
+                for (int li = 0; li < tln; li++) {
+                    TermEngine *lte = (TermEngine *)session_engine(tl[li]->leaf.session);
+                    if (lte) term_engine_apply_theme(lte, &th);
+                }
+            }
             apply_gui_style(&th);
+            ui_theme_derive(&th);      // -> also updates g_ui_theme
             snprintf(applied_theme, sizeof(applied_theme), "%s", cfg.theme);
         }
 
-        // Snapshot the terminal state into the render state (through the seam).
-        term_engine_update(te);
+        // Snapshot the terminal state into the render state for every session in
+        // the active tab.  Each leaf needs its own snapshots before we draw,
+        // otherwise stale render states produce visual flicker / blank panes (§16.4).
+        {
+            Tab *rtab = &app.tabs[app.active];
+            PaneNode *rleaves[64];
+            int rn_leaves = 0;
+            pane_collect_leaves(rtab->root, rleaves, 64, &rn_leaves);
+            for (int li = 0; li < rn_leaves; li++) {
+                Session *ls = rleaves[li]->leaf.session;
+                if (ls) term_engine_update((TermEngine *)session_engine(ls));
+            }
+        }
 
         // Drain any AI tokens the worker thread produced since last frame and
         // append them to the streaming assistant message. All on the main
@@ -2288,64 +2664,128 @@ int main(void)
                                  &scrollbar) == GHOSTTY_SUCCESS)
             scrollbar_ptr = &scrollbar;
 
-        // Draw the current terminal screen.
+        // Draw every pane in the active tab. For single-pane layouts this
+        // renders once at (lo.terminal.x, lo.terminal.y, lo.terminal.w, lo.terminal.h).
         BeginDrawing();
         ClearBackground(win_bg);
-        BeginScissorMode(lo.terminal.x, lo.terminal.y, lo.terminal.w, lo.terminal.h);
-        render_terminal(render_state, row_iter, row_cells, mono_font,
-                        cell_width, cell_height, font_size, pad,
-                        term_area_w, scrollbar_ptr, terminal, placement_iter);
 
-        // Command-block overlay: separators, gutter, ✓/✗ status badges, and
-        // hover "copy output" / "Ask AI" buttons — all driven by OSC-133
-        // marks. Drawn inside the terminal scissor so it never bleeds into
-        // the sidebar.
-        CmdBlockAction cb_action = {0};
-        bool block_click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
-            && GetMouseX() < term_area_w
-            && !ui_settings_open() && !ui_inline_active() && !ui_sidebar_focused();
-        if (cmdblocks_draw(te, mono_font, &theme, cell_width, cell_height, font_size,
-                           pad, term_area_w, term_rows,
-                           GetMouseX(), GetMouseY(), block_click,
-                           &cb_action)) {
-            // The copy-button click shouldn't leave a stray 1-cell selection.
-            g_sel.active = false;
-            g_sel.dragging = false;
+        Tab *tab = &app.tabs[app.active];
+        PaneNode *leaves[64];
+        int n_leaves = 0;
+        pane_collect_leaves(tab->root, leaves, 64, &n_leaves);
 
-            // E1 (§15): "Ask AI" click → open sidebar, build context, prefill.
-            if (cb_action.action == CB_ACTION_ASK_AI) {
-                // Build context text from the block's command+output+exit_code.
-                char ctx_buf[16384];
-                ai_block_build_context(cb_action.command,
-                                       cb_action.output ? cb_action.output : "",
-                                       cb_action.exit_code,
-                                       ctx_buf, (int)sizeof(ctx_buf));
+        // Allocate enough space for all leaf rects.
+        PaneRectEntry pane_rects[64];
+        PaneRectCollector collector = {
+            .entries = pane_rects,
+            .count = 0,
+            .capacity = 64,
+        };
+        layout_compute_panes(tab->root,
+                             lo.terminal.x, lo.terminal.y,
+                             lo.terminal.w, lo.terminal.h,
+                             pane_rect_collect_cb, &collector);
 
-                // Redact secrets from the context before handing to the model.
-                char *redacted = redact_secrets(ctx_buf);
-                if (redacted) {
-                    ui_sidebar_set_oneshot_context(redacted);  // takes ownership
-                } else {
-                    ui_sidebar_set_oneshot_context(strdup(ctx_buf));
-                }
+        for (int i = 0; i < collector.count; i++) {
+            PaneNode *leaf = collector.entries[i].leaf;
+            int px = collector.entries[i].x;
+            int py = collector.entries[i].y;
+            int pw = collector.entries[i].w;
+            int ph = collector.entries[i].h;
 
-                // Prefill the input with the default question.
-                ui_sidebar_prefill(ai_block_default_question(cb_action.exit_code));
+            if (pw < 1 || ph < 1) continue;
 
-                // Ensure sidebar is open and focused.
-                if (!ui_sidebar_visible())
-                    ui_sidebar_toggle();
-                else
-                    ui_sidebar_focus(true);
+            Session *ss = leaf->leaf.session;
+            TermEngine *lte = (TermEngine *)session_engine(ss);
+            if (!lte) continue;
 
-                // Free the malloc'd output from the action.
-                if (cb_action.output) {
-                    free(cb_action.output);
-                    cb_action.output = NULL;
+            // Borrow render handles from this session's term_engine, exactly
+            // as the main loop does for the active session (§16.4).
+            GhosttyTerminal lterm = term_engine_terminal(lte);
+            GhosttyRenderState lrs = term_engine_render_state(lte);
+            GhosttyRenderStateRowIterator lri = term_engine_row_iter(lte);
+            GhosttyRenderStateRowCells lrc = term_engine_row_cells(lte);
+            GhosttyKittyGraphicsPlacementIterator lpi = term_engine_placement_iter(lte);
+
+            // Query scrollbar state.
+            GhosttyTerminalScrollbar lsb = {0};
+            GhosttyTerminalScrollbar *lsb_ptr = NULL;
+            if (ghostty_terminal_get(lterm, GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                                     &lsb) == GHOSTTY_SUCCESS)
+                lsb_ptr = &lsb;
+
+            // Compute the pane's grid in cells (for scrollbar bounds).
+            int lterm_cols = (pw - 2 * pad) / cell_width;
+            if (lterm_cols < 1) lterm_cols = 1;
+            int lterm_rows = (ph - 2 * pad) / cell_height;
+            if (lterm_rows < 1) lterm_rows = 1;
+            int lpane_term_area_w = pw;
+
+            BeginScissorMode(px, py, pw, ph);
+            render_terminal(lrs, lri, lrc, mono_font, bold_font,
+                            cell_width, cell_height, font_size, pad,
+                            lpane_term_area_w, lsb_ptr, lterm, lpi,
+                            px, py, &cfg, frame_count);
+
+            // Focused-pane highlight (a 1-pixel bright border).
+            if (leaf == tab->focused) {
+                Color focus_border = UI2RAY(g_ui_theme.focus_border);
+                DrawRectangle(px, py, pw, 1, focus_border);                    // top
+                DrawRectangle(px, py, 1, ph, focus_border);                    // left
+                DrawRectangle(px, py + ph - 1, pw, 1, focus_border);          // bottom
+                DrawRectangle(px + pw - 1, py, 1, ph, focus_border);          // right
+            }
+
+            // Command-block overlay for the focused pane only.
+            if (leaf == tab->focused && g_cmdblocks) {
+                CmdBlockAction cb_action = {0};
+                bool block_click = IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
+                    && GetMouseX() >= px && GetMouseX() < px + pw
+                    && GetMouseY() >= py && GetMouseY() < py + ph
+                    && !ui_settings_open() && !ui_inline_active() && !ui_sidebar_focused();
+                if (cmdblocks_draw(g_cmdblocks, te, mono_font, &theme,
+                                   cell_width, cell_height, font_size,
+                                   pad, lpane_term_area_w, lterm_rows,
+                                   GetMouseX(), GetMouseY(), block_click,
+                                   &cb_action)) {
+                    g_sel.active = false;
+                    g_sel.dragging = false;
+
+                    if (cb_action.action == CB_ACTION_ASK_AI) {
+                        char ctx_buf[16384];
+                        ai_block_build_context(cb_action.command,
+                                               cb_action.output ? cb_action.output : "",
+                                               cb_action.exit_code,
+                                               ctx_buf, (int)sizeof(ctx_buf));
+                        char *redacted = redact_secrets(ctx_buf);
+                        if (redacted) {
+                            ui_sidebar_set_oneshot_context(redacted);
+                        } else {
+                            ui_sidebar_set_oneshot_context(strdup(ctx_buf));
+                        }
+                        ui_sidebar_prefill(ai_block_default_question(cb_action.exit_code));
+                        ui_sidebar_open_focused();
+                        if (cb_action.output) {
+                            free(cb_action.output);
+                            cb_action.output = NULL;
+                        }
+                    }
                 }
             }
+            EndScissorMode();
         }
-        EndScissorMode();
+
+        // Draw gutter lines between panes (the gap from layout_compute_panes
+        // creates a 2-pixel gap; fill it with the background color or a
+        // subtle separator).
+        for (int i = 0; i < collector.count; i++) {
+            PaneNode *leaf = collector.entries[i].leaf;
+            // Only draw a gutter for internal (non-leaf) children — visual
+            // gaps are already handled by compute_panes_rec.  Draw a thin
+            // line along the right edge of each left-child region to make
+            // the split visually distinct.
+            (void)leaf;
+        }
 
         if (g_search_active) {
             int matches = draw_search_highlights(pad, cell_width, cell_height);
@@ -2354,7 +2794,13 @@ int main(void)
 
         if (ui_sidebar_visible() && lo.sidebar_visible) {
             DrawLine(lo.sidebar.x, 0, lo.sidebar.x, lo.sidebar.h,
-                     (Color){60, 60, 60, 255});
+                     UI2RAY(g_ui_theme.sidebar_separator));
+            // E5: tell the sidebar whether a key is configured so it can show
+            // the first-run setup card instead of a dead input.
+            const char *cur_key = resolve_api_key(&cfg);
+            ui_sidebar_set_has_key(cur_key && cur_key[0]);
+            // out_prompt carries just the question now; any §15 block context
+            // is taken separately below, so this buffer stays small.
             char submitted[1024] = "";
             char run_cmd[1024] = "";
             // The UI renders in logical space (crispness from the 2x font
@@ -2369,17 +2815,22 @@ int main(void)
                     ui_sidebar_end_assistant();
                 }
                 ui_sidebar_push(MSG_USER, submitted);
+                // §15: redacted command-block context (NULL for a normal turn).
+                // Sent to the model in place of the scrollback dump, not shown
+                // in the chat bubble. We own it and must free it.
+                char *block_ctx = ui_sidebar_take_oneshot_context();
                 const char *key = resolve_api_key(&cfg);
                 if (!key || !key[0]) {
                     ui_sidebar_push(MSG_SYSTEM,
                         "No API key. Set FANGS_API_KEY or add one in Ctrl+, settings.");
                 } else {
-                    active_stream = start_ai_request(te, &cfg, submitted);
+                    active_stream = start_ai_request(te, &cfg, submitted, block_ctx);
                     if (active_stream)
                         ui_sidebar_begin_assistant();
                     else
                         ui_sidebar_push(MSG_SYSTEM, "Failed to start the AI request.");
                 }
+                free(block_ctx);
             }
             // Run button: stage the command at the prompt — NO trailing newline,
             // the user reviews and presses Enter themselves.
@@ -2419,12 +2870,15 @@ int main(void)
             int screen_h = GetScreenHeight();
             int banner_h = (int)msg_size.y + 8;
             DrawRectangle(0, screen_h - banner_h, screen_w, banner_h,
-                          (Color){0, 0, 0, 180});
+                          UI2RAY(g_ui_theme.exit_banner_bg));
             DrawTextEx(mono_font, exit_msg,
                        (Vector2){(screen_w - msg_size.x) / 2,
                                  screen_h - banner_h + 4},
-                       font_size, 0, WHITE);
+                       font_size, 0, UI2RAY(g_ui_theme.exit_banner_text));
         }
+
+        // Advance toast timers each frame.
+        toast_tick(GetFrameTime());
 
         if (ui_settings_open()) {
             bool saved = false;
@@ -2432,9 +2886,40 @@ int main(void)
             if (saved) {
                 if (!config_save(&cfg, config_path)) {
                     fprintf(stderr, "warning: failed to save config at %s\n", config_path);
+                    toast_push(TOAST_WARN, "Failed to save config.");
                 } else {
                     apply_saved_config = true;
+                    toast_push(TOAST_INFO, "Settings saved.");
                 }
+            }
+        }
+
+        // Draw toast notifications (fading pills, bottom-right).
+        {
+            int n_toasts = toast_count();
+            int toast_w = 360;
+            int toast_x = GetScreenWidth() - toast_w - 12;
+            int toast_y = GetScreenHeight() - 12;
+            for (int i = 0; i < n_toasts; i++) {
+                ToastLevel tl;
+                const char *tmsg;
+                float talpha;
+                if (!toast_get(i, &tl, &tmsg, &talpha)) break;
+                if (talpha <= 0.0f) continue;
+                Color tbg;
+                switch (tl) {
+                    case TOAST_ERROR: tbg = (Color){ 180, 50, 50, (unsigned char)(220 * talpha) }; break;
+                    case TOAST_WARN:  tbg = (Color){ 200, 150, 30, (unsigned char)(220 * talpha) }; break;
+                    default:          tbg = (Color){ 60, 60, 60, (unsigned char)(220 * talpha) }; break;
+                }
+                Vector2 tsz = MeasureTextEx(mono_font, tmsg, font_size, 0);
+                int th = (int)tsz.y + 8;
+                toast_y -= th + 4;
+                DrawRectangle(toast_x, toast_y, toast_w, th, tbg);
+                Color tc = (Color){ 220, 220, 220, (unsigned char)(255 * talpha) };
+                DrawTextEx(mono_font, tmsg,
+                           (Vector2){ (float)toast_x + 6, (float)toast_y + 4 },
+                           font_size, 0, tc);
             }
         }
 
@@ -2474,11 +2959,11 @@ int main(void)
         }
 
         if (apply_saved_config) {
-            if (!apply_config(&cfg, &mono_font, &font_size,
-                              &cell_width, &cell_height,
-                              &term_cols, &term_rows, term_area_w, pad,
-                              te, pty_fd, &effects_ctx)) {
+            if (!apply_config_all_sessions(&cfg, &mono_font, &bold_font, &font_size,
+                                            &cell_width, &cell_height,
+                                            &term_cols, &term_rows, term_area_w, pad)) {
                 fprintf(stderr, "warning: failed to apply config\n");
+                toast_push(TOAST_WARN, "Failed to apply config.");
             } else {
                 prev_width = GetScreenWidth();
                 prev_height = GetScreenHeight();
@@ -2503,17 +2988,10 @@ cleanup:
     if (mono_font.texture.id != 0)
         UnloadFont(mono_font);
     CloseWindow();
-    if (pty_fd >= 0)
-        close(pty_fd);
-    if (child > 0 && !child_reaped) {
-        // If the child is still running, ask it to exit.  Then do a
-        // blocking waitpid to reap it and avoid leaving a zombie.
-        if (!child_exited)
-            kill(child, SIGHUP);
-        waitpid(child, NULL, 0);
-    }
-    cmdblocks_reset();
-    if (te) term_engine_destroy(te);
+    // Destroy all tabs/sessions — this closes PTY fds, kills children,
+    // destroys term engines, and frees userdata via session_destroy().
+    app_destroy_all();
+    if (g_cmdblocks) cmdblocks_destroy(g_cmdblocks);
     ai_global_cleanup();
     return exit_code;
 }

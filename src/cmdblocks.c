@@ -16,7 +16,7 @@ typedef struct {
     bool done;                   // OSC D seen
 } CbBlock;
 
-static struct {
+struct CmdBlocks {
     CbParser parser;
 
     CbBlock ring[CB_RING];       // finished blocks (circular)
@@ -29,35 +29,52 @@ static struct {
     bool cur_has;
     int  cur_code;
     bool cur_done;
-} g_cb;
+};
+
+CmdBlocks *cmdblocks_create(void)
+{
+    CmdBlocks *cb = (CmdBlocks *)calloc(1, sizeof(CmdBlocks));
+    return cb;
+}
+
+void cmdblocks_destroy(CmdBlocks *cb)
+{
+    if (!cb) return;
+    for (int k = 0; k < cb->count; k++) {
+        int idx = (cb->head + k) % CB_RING;
+        if (cb->ring[idx].top) ghostty_tracked_grid_ref_free(cb->ring[idx].top);
+    }
+    if (cb->cur_top) ghostty_tracked_grid_ref_free(cb->cur_top);
+    free(cb);
+}
 
 // --- model -------------------------------------------------------------------
 
-static void push_finished(GhosttyTrackedGridRef top, int code, bool done)
+static void push_finished(CmdBlocks *cb, GhosttyTrackedGridRef top, int code, bool done)
 {
-    int idx = (g_cb.head + g_cb.count) % CB_RING;
-    if (g_cb.count == CB_RING) {
-        if (g_cb.ring[idx].top) ghostty_tracked_grid_ref_free(g_cb.ring[idx].top);
-        g_cb.head = (g_cb.head + 1) % CB_RING;
+    int idx = (cb->head + cb->count) % CB_RING;
+    if (cb->count == CB_RING) {
+        if (cb->ring[idx].top) ghostty_tracked_grid_ref_free(cb->ring[idx].top);
+        cb->head = (cb->head + 1) % CB_RING;
     } else {
-        g_cb.count++;
+        cb->count++;
     }
-    g_cb.ring[idx].top  = top;
-    g_cb.ring[idx].code = code;
-    g_cb.ring[idx].done = done;
+    cb->ring[idx].top  = top;
+    cb->ring[idx].code = code;
+    cb->ring[idx].done = done;
 }
 
 // A new prompt: retire the previous live block to the ring, anchor a fresh
 // tracked ref at the current prompt row.
-static void on_prompt(GhosttyTerminal term, uint16_t row)
+static void on_prompt(CmdBlocks *cb, GhosttyTerminal term, uint16_t row)
 {
-    if (g_cb.cur_has)
-        push_finished(g_cb.cur_top, g_cb.cur_code, g_cb.cur_done);
+    if (cb->cur_has)
+        push_finished(cb, cb->cur_top, cb->cur_code, cb->cur_done);
 
-    g_cb.cur_top  = NULL;
-    g_cb.cur_has  = false;
-    g_cb.cur_code = -1;
-    g_cb.cur_done = false;
+    cb->cur_top  = NULL;
+    cb->cur_has  = false;
+    cb->cur_code = -1;
+    cb->cur_done = false;
 
     GhosttyPoint pt = { .tag = GHOSTTY_POINT_TAG_VIEWPORT };
     pt.value.coordinate.x = 0;
@@ -65,19 +82,21 @@ static void on_prompt(GhosttyTerminal term, uint16_t row)
 
     GhosttyTrackedGridRef ref = NULL;
     if (ghostty_terminal_grid_ref_track(term, pt, &ref) == GHOSTTY_SUCCESS && ref) {
-        g_cb.cur_top = ref;
-        g_cb.cur_has = true;
+        cb->cur_top = ref;
+        cb->cur_has = true;
     }
 }
 
-void cmdblocks_feed(TermEngine *te, const uint8_t *data, size_t len)
+void cmdblocks_feed(CmdBlocks *cb, TermEngine *te, const uint8_t *data, size_t len)
 {
+    if (!cb) return;
+
     GhosttyTerminal    term = term_engine_terminal(te);
     GhosttyRenderState rs   = term_engine_render_state(te);
 
     size_t flush = 0, pos = 0;
     CbHit hit;
-    while (cb_parse_next(&g_cb.parser, data, len, &pos, &hit)) {
+    while (cb_parse_next(&cb->parser, data, len, &pos, &hit)) {
         if (hit.mark == CB_MARK_PROMPT) {
             // Flush through the A terminator so the engine's cursor is parked at
             // the new prompt row, then anchor a tracked ref there.
@@ -88,11 +107,11 @@ void cmdblocks_feed(TermEngine *te, const uint8_t *data, size_t len)
             ghostty_render_state_update(rs, term);
             uint16_t cy = 0;
             ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cy);
-            on_prompt(term, cy);
+            on_prompt(cb, term, cy);
         } else if (hit.mark == CB_MARK_DONE) {
-            if (g_cb.cur_has) {
-                g_cb.cur_code = hit.code;
-                g_cb.cur_done = true;
+            if (cb->cur_has) {
+                cb->cur_code = hit.code;
+                cb->cur_done = true;
             }
         }
         // CB_MARK_CMD / CB_MARK_EXEC: reserved, no-op for now.
@@ -100,16 +119,6 @@ void cmdblocks_feed(TermEngine *te, const uint8_t *data, size_t len)
 
     if (len > flush)
         term_engine_write(te, data + flush, len - flush);
-}
-
-void cmdblocks_reset(void)
-{
-    for (int k = 0; k < g_cb.count; k++) {
-        int idx = (g_cb.head + k) % CB_RING;
-        if (g_cb.ring[idx].top) ghostty_tracked_grid_ref_free(g_cb.ring[idx].top);
-    }
-    if (g_cb.cur_top) ghostty_tracked_grid_ref_free(g_cb.cur_top);
-    memset(&g_cb, 0, sizeof(g_cb));
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -186,8 +195,14 @@ static char *block_command_text(GhosttyTerminal term, int top_v)
     if (ghostty_terminal_grid_ref(term, pt, &ref) != GHOSTTY_SUCCESS)
         return NULL;
 
+    // The prompt row is the command *input* line (prompt prefix + typed
+    // command), not command output. select_output returns NO_VALUE on a
+    // non-output row, which would leave the command empty — use select_line.
+    GhosttyTerminalSelectLineOptions lo =
+        GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+    lo.ref = ref;
     GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
-    if (ghostty_terminal_select_output(term, ref, &sel) != GHOSTTY_SUCCESS)
+    if (ghostty_terminal_select_line(term, &lo, &sel) != GHOSTTY_SUCCESS)
         return NULL;
 
     GhosttyTerminalSelectionFormatOptions o =
@@ -213,12 +228,13 @@ static char *block_command_text(GhosttyTerminal term, int top_v)
     return NULL;
 }
 
-bool cmdblocks_draw(TermEngine *te, Font font, const Theme *th,
+bool cmdblocks_draw(CmdBlocks *cb, TermEngine *te, Font font, const Theme *th,
                     int cell_w, int cell_h, int font_size,
                     int pad, int term_area_w, int rows,
                     int mouse_x, int mouse_y, bool click,
                     CmdBlockAction *action)
 {
+    if (!cb) return false;
     (void)cell_w;
     GhosttyTerminal term = term_engine_terminal(te);
 
@@ -229,15 +245,15 @@ bool cmdblocks_draw(TermEngine *te, Font font, const Theme *th,
     CbItem items[CB_RING + 1];
     int n = 0;
 
-    for (int k = 0; k < g_cb.count; k++) {
-        CbBlock *b = &g_cb.ring[(g_cb.head + k) % CB_RING];
+    for (int k = 0; k < cb->count; k++) {
+        CbBlock *b = &cb->ring[(cb->head + k) % CB_RING];
         int r;
         if (!top_vrow(b->top, &r) || r < 0 || r >= rows) continue;
         items[n].row = r; items[n].code = b->code; items[n].live = false; n++;
     }
-    if (g_cb.cur_has) {
+    if (cb->cur_has) {
         int r;
-        if (top_vrow(g_cb.cur_top, &r) && r >= 0 && r < rows) {
+        if (top_vrow(cb->cur_top, &r) && r >= 0 && r < rows) {
             items[n].row = r; items[n].code = -1; items[n].live = true; n++;
         }
     }
@@ -330,8 +346,11 @@ bool cmdblocks_draw(TermEngine *te, Font font, const Theme *th,
                    (Vector2){ copy_btn.x + padx, copy_btn.y + (btn_h - copy_ts.y) / 2 },
                    (float)btn_fs, 0, tc_color(th->fg, 230));
 
-        // "Ask AI" button (left of copy button)
-        const char *ai_label = "Ask AI";
+        // "Ask AI" button (left of copy button). Failed blocks get an
+        // emphasized "Explain error" label (the button already red-tints via
+        // `st`); a literal ⚡ glyph isn't in the embedded font atlas, so the
+        // emphasis is the label + status color, not an emoji.
+        const char *ai_label = items[hovered].code > 0 ? "Explain error" : "Ask AI";
         Vector2 ai_ts = MeasureTextEx(font, ai_label, (float)btn_fs, 0);
         int ai_w = (int)ai_ts.x + 2 * padx;
         int ai_gap = 4;
@@ -380,8 +399,9 @@ bool cmdblocks_draw(TermEngine *te, Font font, const Theme *th,
 
 // --- navigation --------------------------------------------------------------
 
-bool cmdblocks_navigate(TermEngine *te, int dir)
+bool cmdblocks_navigate(CmdBlocks *cb, TermEngine *te, int dir)
 {
+    if (!cb) return false;
     GhosttyTerminal term = term_engine_terminal(te);
 
     // Current viewport top in absolute screen coordinates.
@@ -397,10 +417,12 @@ bool cmdblocks_navigate(TermEngine *te, int dir)
 
     bool found = false;
     long best = 0;
-    for (int k = 0; k <= g_cb.count; k++) {
-        GhosttyTrackedGridRef ref = (k < g_cb.count)
-            ? g_cb.ring[(g_cb.head + k) % CB_RING].top
-            : g_cb.cur_top;
+    long max_long = (dir < 0) ? -999999 : 999999;
+    best = max_long;
+    for (int k = 0; k <= cb->count; k++) {
+        GhosttyTrackedGridRef ref = (k < cb->count)
+            ? cb->ring[(cb->head + k) % CB_RING].top
+            : cb->cur_top;
         if (!ref) continue;
 
         GhosttyPointCoordinate sc;

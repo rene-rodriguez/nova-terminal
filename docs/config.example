@@ -1,0 +1,22 @@
+;; Fangs terminal configuration
+;; Place this file at ~/.config/fangs/config
+;;
+;; The API key is read from $FANGS_API_KEY by default (recommended).
+;; Only put it in this file as a fallback — the file is chmod 0600
+;; on write, but env vars are still harder to accidentally commit.
+
+[terminal]
+font_family = JetBrainsMono Nerd Font
+font_size = 16
+theme = dark
+scrollback = 1000
+cursor_style = 0      ;; 0=block, 1=bar, 2=underline
+cursor_blink = true
+
+[ai]
+provider = openai     ;; "openai" (OpenAI-compatible) or "anthropic"
+endpoint = https://api.openai.com/v1/chat/completions
+model = gpt-4o-mini
+api_key =             ;; prefer $FANGS_API_KEY over this field
+stream = true
+max_tokens = 1024

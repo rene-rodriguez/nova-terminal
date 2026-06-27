@@ -275,3 +275,17 @@ PaneNode *pane_next_leaf(PaneNode *root, PaneNode *cur)
     bool found = false;
     return pane_next_leaf_rec(root, cur, &found);
 }
+
+void pane_collect_leaves(PaneNode *root, PaneNode **out, int max, int *n)
+{
+    if (!root || !out || !n)
+        return;
+    if (*n >= max)
+        return;
+    if (root->kind == PANE_LEAF) {
+        out[(*n)++] = root;
+    } else {
+        pane_collect_leaves(root->split.left,  out, max, n);
+        pane_collect_leaves(root->split.right, out, max, n);
+    }
+}

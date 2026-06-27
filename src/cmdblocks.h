@@ -12,6 +12,9 @@
 // unmodified (the engine does its own OSC-133 tracking, which powers the
 // select_output API we use for copy). Without shell integration there are no
 // marks and the overlay simply never draws.
+//
+// Per-session (§16.7): each Session owns its own CmdBlocks instance, so
+// every pane tracks its own command blocks independently.
 #ifndef FANGS_CMDBLOCKS_H
 #define FANGS_CMDBLOCKS_H
 
@@ -22,6 +25,9 @@
 #include "raylib.h"
 #include "term_engine.h"
 #include "theme.h"
+
+// Opaque handle — one per Session (§16.7).
+typedef struct CmdBlocks CmdBlocks;
 
 // Action reported when a hover button is clicked. The host checks `action`
 // after cmdblocks_draw returns true, reads the block data, and takes the
@@ -44,15 +50,19 @@ typedef struct {
     int   output_len;       // byte length of output (0 if none)
 } CmdBlockAction;
 
+// Create/destroy a CmdBlocks instance (one per Session).
+CmdBlocks *cmdblocks_create(void);
+void       cmdblocks_destroy(CmdBlocks *cb);
+
 // PTY sink: forward a chunk to the engine while tracking command boundaries.
 // Drop-in replacement for a bare term_engine_write() in the read loop.
-void cmdblocks_feed(TermEngine *te, const uint8_t *data, size_t len);
+void cmdblocks_feed(CmdBlocks *cb, TermEngine *te, const uint8_t *data, size_t len);
 
 // Draw the block overlay over the already-rendered grid. Call inside the
 // terminal scissor each frame. When a hover button is clicked, fills *action
 // and returns true (consumed). The caller must free action->output when
 // action->action == CB_ACTION_ASK_AI.
-bool cmdblocks_draw(TermEngine *te, Font font, const Theme *theme,
+bool cmdblocks_draw(CmdBlocks *cb, TermEngine *te, Font font, const Theme *theme,
                     int cell_w, int cell_h, int font_size,
                     int pad, int term_area_w, int rows,
                     int mouse_x, int mouse_y, bool click,
@@ -61,9 +71,6 @@ bool cmdblocks_draw(TermEngine *te, Font font, const Theme *theme,
 // Scroll the viewport to the previous (dir < 0) or next (dir > 0) command.
 // Returns true only if there was a target to scroll to, so the caller can let
 // the key fall through to the child (e.g. a TUI) when there's nothing to do.
-bool cmdblocks_navigate(TermEngine *te, int dir);
-
-// Free all tracked grid refs (call once at shutdown).
-void cmdblocks_reset(void);
+bool cmdblocks_navigate(CmdBlocks *cb, TermEngine *te, int dir);
 
 #endif // FANGS_CMDBLOCKS_H

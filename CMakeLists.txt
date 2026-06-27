@@ -43,7 +43,7 @@ find_package(CURL REQUIRED)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-# --- Embed font as a C header (avoids C23 #embed) ----------------------------
+# --- Embed fonts as C headers (avoids C23 #embed) ---------------------------
 set(FONT_INPUT  "${CMAKE_SOURCE_DIR}/assets/JetBrainsMono-Regular.ttf")
 set(FONT_HEADER "${CMAKE_BINARY_DIR}/font_jetbrains_mono.h")
 add_custom_command(
@@ -55,6 +55,18 @@ add_custom_command(
     -P ${CMAKE_SOURCE_DIR}/cmake/bin2header.cmake
   DEPENDS "${FONT_INPUT}" "${CMAKE_SOURCE_DIR}/cmake/bin2header.cmake"
   COMMENT "Generating font_jetbrains_mono.h")
+
+set(FONT_BOLD_INPUT  "${CMAKE_SOURCE_DIR}/assets/JetBrainsMono-Bold.ttf")
+set(FONT_BOLD_HEADER "${CMAKE_BINARY_DIR}/font_jetbrains_mono_bold.h")
+add_custom_command(
+  OUTPUT "${FONT_BOLD_HEADER}"
+  COMMAND ${CMAKE_COMMAND}
+    -DINPUT=${FONT_BOLD_INPUT}
+    -DOUTPUT=${FONT_BOLD_HEADER}
+    -DARRAY_NAME=font_jetbrains_mono_bold
+    -P ${CMAKE_SOURCE_DIR}/cmake/bin2header.cmake
+  DEPENDS "${FONT_BOLD_INPUT}" "${CMAKE_SOURCE_DIR}/cmake/bin2header.cmake"
+  COMMENT "Generating font_jetbrains_mono_bold.h")
 
 # --- fangs ----------------------------------------------------------------
 add_executable(fangs
@@ -76,11 +88,15 @@ add_executable(fangs
   src/cmdblocks.c
   src/cmdblocks_osc.c
   src/theme.c
+  src/ui_theme.c
   src/cJSON.c
   src/ai_block.c
   src/session.c
   src/pane.c
-  "${FONT_HEADER}")
+  src/ui_toast.c
+  src/ui_effects.c
+  "${FONT_HEADER}"
+  "${FONT_BOLD_HEADER}")
 target_compile_features(fangs PRIVATE c_std_11)
 target_include_directories(fangs PRIVATE
   "${CMAKE_BINARY_DIR}"          # generated font header
@@ -178,3 +194,20 @@ add_executable(pane_tests
 target_compile_features(pane_tests PRIVATE c_std_11)
 target_include_directories(pane_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
 add_test(NAME pane_tests COMMAND pane_tests)
+
+# --- E5 (§18): Toast notifications (pure logic) -------------------------------
+add_executable(toast_tests
+  tests/toast_tests.c
+  src/ui_toast.c)
+target_compile_features(toast_tests PRIVATE c_std_11)
+target_include_directories(toast_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+add_test(NAME toast_tests COMMAND toast_tests)
+
+# --- E3 (§17): UI theme derive -----------------------------------------------
+add_executable(ui_theme_tests
+  tests/ui_theme_tests.c
+  src/ui_theme.c
+  src/theme.c)
+target_compile_features(ui_theme_tests PRIVATE c_std_11)
+target_include_directories(ui_theme_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+add_test(NAME ui_theme_tests COMMAND ui_theme_tests)

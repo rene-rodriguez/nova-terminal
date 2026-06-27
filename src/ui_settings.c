@@ -9,6 +9,7 @@
 #include "raygui.h"
 
 #include "theme.h"
+#include "ui_theme.h"
 
 typedef enum {
     EDIT_FONT_FAMILY,
@@ -143,7 +144,7 @@ void ui_settings_draw(AppConfig *cfg, bool *out_saved, float scale)
 
     int screen_w = GetScreenWidth();
     int screen_h = GetScreenHeight();
-    DrawRectangle(0, 0, screen_w, screen_h, (Color){0, 0, 0, 150});
+    DrawRectangle(0, 0, screen_w, screen_h, UI2RAY(g_ui_theme.modal_overlay));
 
     float panel_w = 620.0f * s;
     float panel_h = 560.0f * s;
