@@ -2364,8 +2364,11 @@ int main(void)
 
         // Ask AI about the latest finished command block: keyboard equivalent
         // of the hover "Ask AI" button, using the same §15 action path.
+        // Cmd+Shift+/ (macOS) / Ctrl+Shift+/ (Linux) — tab_chord already encodes
+        // that split, so requiring shift on top yields both. (Super+Shift on
+        // Linux would be swallowed by the window manager.)
         bool ask_last_command_consumed = false;
-        if (cmd_down && shift_down && IsKeyPressed(KEY_SLASH)
+        if (tab_chord && shift_down && IsKeyPressed(KEY_SLASH)
             && !ui_settings_open() && !ui_inline_active() && !g_search_active) {
             CmdBlockAction latest_action = {0};
             if (cmdblocks_latest_action(g_cmdblocks, te, term_rows, &latest_action)) {
