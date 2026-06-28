@@ -59,22 +59,28 @@ drops the rest:
 
 ## Install
 
-### Quick install (prebuilt binary)
+### Quick install (macOS app, Linux CLI)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/rene-rodriguez/fangs/main/install.sh | sh
 ```
 
-Detects your OS and CPU, downloads the matching tarball from the
-[latest release](https://github.com/rene-rodriguez/fangs/releases/latest), and installs it
-under `~/.local` (`bin/fangs` plus the bundled `libghostty-vt`, resolved via a relative
-RPATH). Make sure `~/.local/bin` is on your `PATH`, then run `fangs`.
+Detects your OS and CPU, downloads the matching asset from the
+[latest release](https://github.com/rene-rodriguez/fangs/releases/latest), and installs the
+native launch target for your platform. macOS installs `Fangs.app` under `~/Applications`;
+Linux installs the CLI under `~/.local` (`bin/fangs` plus the bundled `libghostty-vt`,
+resolved via a relative RPATH).
 
 | Option | How |
 |---|---|
-| Install to a custom prefix | `curl … \| FANGS_PREFIX=/usr/local sh` |
-| Pin a specific version | `curl … \| FANGS_VERSION=v0.1.1 sh` |
+| Install the macOS app elsewhere | `curl … \| FANGS_APP_DIR=/Applications sh` |
+| Force the CLI install on macOS | `curl … \| FANGS_INSTALL=cli sh` |
+| Install the CLI to a custom prefix | `curl … \| FANGS_PREFIX=/usr/local sh` |
+| Pin a specific version | `curl … \| FANGS_VERSION=v0.1.3 sh` |
 | Authenticate a private mirror | `curl … \| FANGS_GITHUB_TOKEN=… sh` (also reads `GH_TOKEN` / `GITHUB_TOKEN`) |
+
+Until Developer ID signing is configured, the macOS app asset is published as an unsigned
+tester zip. If macOS blocks the first launch, right-click `Fangs.app` and choose Open once.
 
 Prebuilt targets: **Linux x86_64** and **macOS arm64** (Apple Silicon). **Intel Macs** and any other
 target build from [source](#build-from-source) — the installer prints exactly how if no prebuilt

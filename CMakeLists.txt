@@ -220,6 +220,14 @@ add_test(
   COMMAND bash "${CMAKE_SOURCE_DIR}/tests/cmake_linux_link_tests.sh")
 
 add_test(
+  NAME install_script_tests
+  COMMAND bash "${CMAKE_SOURCE_DIR}/tests/install_script_tests.sh")
+
+add_test(
+  NAME macos_app_install_docs_tests
+  COMMAND bash "${CMAKE_SOURCE_DIR}/tests/macos_app_install_docs_tests.sh")
+
+add_test(
   NAME macos_release_lib_tests
   COMMAND bash "${CMAKE_SOURCE_DIR}/tests/macos_release_lib_tests.sh")
 

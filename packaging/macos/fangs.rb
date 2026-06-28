@@ -7,15 +7,15 @@
 # fit Homebrew's sandbox — so we ship the bundle instead.
 #
 # MAINTAINER, per release: the release workflow (.github/workflows/release.yml)
-# builds Fangs.app and uploads fangs-<version>-macos-arm64.zip automatically on
-# tag push. Then bump `version` below and set `sha256` to that zip's hash
-# (printed by the workflow's "Bundle .app" step, or `shasum -a 256` of the asset).
+# builds Fangs.app and uploads the app zip automatically on tag push. Without
+# Developer ID secrets, CI publishes fangs-<version>-macos-arm64-unsigned.zip.
+# Bump `version` below and set `sha256` to that zip's hash from the release asset.
 #
 cask "fangs" do
-  version "0.1.1"
-  sha256 "3033a791d100f6b9c828094542af395b2992a1676652f6f9a79d35e5c9a83660"
+  version "0.1.3"
+  sha256 "adf4647e681200f691e60cbdc1f8bf4c57ead8029ec57e37a72f89fb9ad41c97"
 
-  url "https://github.com/rene-rodriguez/fangs/releases/download/v#{version}/fangs-#{version}-macos-arm64.zip"
+  url "https://github.com/rene-rodriguez/fangs/releases/download/v#{version}/fangs-#{version}-macos-arm64-unsigned.zip"
   name "Fangs"
   desc "Native BYOK terminal with an AI sidebar and inline command generation"
   homepage "https://github.com/rene-rodriguez/fangs"
